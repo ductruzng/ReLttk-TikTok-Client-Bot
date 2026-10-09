@@ -24,7 +24,7 @@ from core.proto import f_str, f_varint, f_bytes
 class IndependentReview(unittest.TestCase):
     def setUp(self):
         # Never pick up a real browser ttwid/access_key from the developer's ws_auth.local.json
-        p = patch.object(oneshot, "load_ws_auth", return_value={})
+        p = patch.object(oneshot, "load_ws_auth", return_value={"ttwid": "1|fake-secret-ttwid", "access_key": "c" * 32})
         p.start()
         self.addCleanup(p.stop)
 
@@ -112,7 +112,7 @@ class IndependentReview(unittest.TestCase):
         text = output.getvalue()
         self.assertIn("im-ws-sg.tiktok.com/ws/v2", text)
         self.assertIn("query params: device_platform, version_code, access_key, fpid, aid, ttwid, xsack", text)
-        self.assertIn("handshake-msg: fake handshake reason", text)
+        self.assertNotIn("fake handshake reason", text)
         self.assertIn("response: 400", text)
         self.assertNotIn("fake-secret", text)
 
@@ -162,7 +162,7 @@ class IndependentReview(unittest.TestCase):
                 patch("websockets.connect", AsyncMock(side_effect=InvalidStatus(response))), \
                 contextlib.redirect_stdout(io.StringIO()) as output:
             self.assertEqual(main.cmd_ws_probe("fake"), 1)
-        self.assertIn("handshake-msg: authentication failed", output.getvalue())
+        self.assertNotIn("authentication failed", output.getvalue())
         self.assertIn("HTTP 400", output.getvalue())
         self.assertNotIn("fake-secret", output.getvalue())
 

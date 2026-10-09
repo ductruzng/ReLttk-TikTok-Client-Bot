@@ -4,6 +4,11 @@ Bot dùng API nội bộ TikTok không chính thức. **Chưa xác nhận tin g�
 được tính vào chuỗi TikTok hay không.** Chưa kiểm thử trên điện thoại, đăng nhập
 thật hoặc gửi thật; hướng dẫn này không bảo đảm giao thức hiện tại còn hoạt động.
 
+**Chạy CLI trên Termux. TUI trên Windows chỉ là tiện ích cấu hình tùy chọn.**
+Không cần Textual hoặc Playwright để chạy CLI với phiên/auth đã chuẩn bị.
+Không giữ TUI mở trên điện thoại để làm scheduler; việc đặt lịch Android nằm
+ngoài đợt triển khai này.
+
 ## 1. Môi trường và dependency
 
 Dùng bản mã nguồn hiện có, đặt trong thư mục riêng của Termux, ví dụ
@@ -38,6 +43,11 @@ file và mạng của ứng dụng Termux.
 - Dependency không sử dụng `stealth-requests` đã bỏ. `pycryptodome` nằm riêng trong
   `requirements-windows.txt`; không cần cài cho Termux. Nhập cookie trình duyệt
   Windows không được hỗ trợ trên Android và không được CLI này tự gọi.
+- `requirements-tui.txt` dành riêng cho TUI tùy chọn trên Windows.
+- `requirements-auth-windows.txt` + Chromium dành cho bước lấy auth trên Windows.
+  Không cài Playwright/Chromium theo hướng dẫn desktop vào Termux native. Android
+  không thuộc nền tảng Playwright Python được hỗ trợ chính thức; xem
+  [yêu cầu hệ thống Playwright](https://playwright.dev/python/docs/intro).
 
 Đã kiểm tra cục bộ trên Windows/Python 3.10.11 với websockets 15.0.1, lz4 4.4.5,
 qrcode 8.2, tzdata 2026.5. Đây **không phải** kết quả kiểm thử Android ARM64.
@@ -76,7 +86,53 @@ python -B -m unittest discover -s tests -v
 Kiểm tra dùng phiên giả trong thư mục tạm và WebSocket giả. Không có đăng nhập
 TikTok, gửi tin thật hoặc lịch tự động trong bộ kiểm tra.
 
-## 3. Các lệnh mạng dành cho bước kiểm thử thủ công sau này
+## 3. Chuẩn bị trên Windows và chuyển sang Termux
+
+Các lệnh trong mục này có truy cập TikTok, dành cho bước anh chủ động thực hiện;
+chúng chưa được chạy trong đợt sửa/kiểm tra offline.
+
+Trên Windows, dùng Python trong môi trường của repo:
+
+```powershell
+python -m pip install -r requirements.txt -r requirements-tui.txt -r requirements-auth-windows.txt
+python -m playwright install chromium
+python main.py login
+python main.py capture-ws-auth --session ten_phien
+python main.py tui
+```
+
+Nếu đã có phiên thì không cần đăng nhập lại chỉ để lấy auth. `login` trên Windows
+đã thử capture sau khi lưu phiên; chỉ gọi `capture-ws-auth` khi bước đó chưa thành
+công hoặc cần làm mới. Trên TUI, chọn tài khoản, đồng bộ inbox, chọn hội thoại và
+lưu nội dung vào `streak.local.json`. Không bật scheduler trên Windows nếu sẽ
+chạy cùng tài khoản trên Termux.
+
+Capture mở Chromium ngầm trong context mới, giữ token trong bộ nhớ và chỉ ghi
+`sesion/ws-auth/ten_phien.json` sau khi probe thành công. Đây không phải luồng
+auth không dùng trình duyệt. Handshake thành công chưa chứng minh gửi được DM.
+Auth gắn với tên phiên và fingerprint cookie; đăng nhập lại cần capture lại.
+File `ws_auth.local.json` cũ không được luồng gửi sử dụng; không đổi tên file cũ
+để bỏ qua ràng buộc này.
+
+Dừng bot/TUI trên cả hai máy trước khi chuyển dữ liệu qua kênh riêng (ví dụ SSH/SFTP).
+Chuyển đúng `streak.local.json`, `sesion/ten_phien.json` và
+`sesion/ws-auth/ten_phien.json` vào repo trong `$HOME` Termux. Nếu đã chạy gửi trên
+Windows, chuyển cả thư mục `state/` sau khi dừng mọi tiến trình để giữ ledger và
+WAL đồng bộ. Không chạy cùng tài khoản trên hai thiết bị với hai ledger riêng.
+
+Trong Termux, siết quyền và kiểm tra kế hoạch offline:
+
+```sh
+mkdir -p sesion/ws-auth state
+chmod 700 sesion sesion/ws-auth state
+chmod 600 sesion/ten_phien.json sesion/ws-auth/ten_phien.json streak.local.json
+python -B main.py --config streak.local.json
+```
+
+Không đưa phiên/auth lên Git hoặc thư mục chia sẻ `/sdcard`. `chmod` không mã
+hóa dữ liệu và không cách ly các chương trình khác chạy cùng quyền Termux.
+
+## 4. Các lệnh mạng dành cho bước kiểm thử thủ công sau này
 
 **Không coi cấu hình giao thức là đã xác minh hoạt động.** Token mẫu cũ nhúng trong
 mã đã bị loại bỏ. Các tham số device, SDK và chữ ký kế thừa từ repo vẫn cần kiểm
@@ -87,12 +143,15 @@ Các lệnh sau có kết nối TikTok, chỉ dùng khi anh chủ động thực
 
 ```sh
 python main.py login
+python main.py ws-probe --session ten_phien
 python main.py list-conversations --session ten_phien
 python main.py --config streak.local.json --send
 ```
 
 Đăng nhập cần terminal tương tác để hiển thị QR; không in URL QR chứa token để
-làm phương án dự phòng. Cách quét QR trên cùng một điện thoại chưa được kiểm thử.
+làm phương án dự phòng. `login` trên Termux không tự chạy browser capture;
+phiên mới vẫn cần bước auth trên Windows. Cách quét QR trên cùng một điện thoại
+chưa được kiểm thử. `ws-probe` chỉ kết nối rồi đóng, không gửi frame hoặc DM.
 Lệnh liệt kê bắt buộc chọn phiên rõ ràng. Trước khi gửi, bot đối chiếu ID hội thoại,
 short ID và loại hội thoại với inbox của phiên đó; không tìm thấy thì dừng.
 
@@ -100,7 +159,7 @@ Mỗi lần chạy gửi một lượt rồi kết thúc. Không cài cron, Task
 lịch tự động. Android có thể dừng tiến trình nền; xem
 [tài liệu Termux](https://github.com/termux/termux-app#installation).
 
-## 4. Chống gửi trùng và xử lý trạng thái
+## 5. Chống gửi trùng và xử lý trạng thái
 
 Ledger `state/streak_ledger.db` giữ một lượt cho mỗi UID/hội thoại/ngày theo
 `Asia/Ho_Chi_Minh`. Lượt `pending` được ghi bền vững trước khi gửi. Chỉ echo từ máy
@@ -113,6 +172,7 @@ TikTok đã tính chuỗi.
   Kiểm tra hội thoại thật và ledger thủ công trước khi xử lý; không xóa database
   chỉ để bỏ qua giới hạn. Không có lệnh tự động giải phóng pending.
 - Nếu phản hồi/lỗi vượt qua nửa đêm, ngày mới cũng được chặn thận trọng.
+- Không có tùy chọn ép gửi lại hoặc bỏ qua ledger.
 
 ```sh
 python main.py status
@@ -122,7 +182,7 @@ Giới hạn chỉ có hiệu lực khi giữ nguyên một ledger trên một t
 bao gồm tin gửi thủ công trên ứng dụng, thiết bị khác, state bị xóa hay đồng hồ
 sai. Giữ giờ/ngày của điện thoại chính xác.
 
-## 5. Phiên và dịch vụ kết nối
+## 6. Phiên và dịch vụ kết nối
 
 Phiên là JSON **không mã hóa** trong `sesion/`: thư mục 0700, file 0600 trên POSIX.
 Quyền này không bảo vệ khỏi mã khác chạy cùng quyền Termux. Lỗi siết quyền phải
@@ -133,7 +193,7 @@ Không đưa phiên, cookie, ledger, log hoặc cấu hình cá nhân lên Git h
 | --- | --- |
 | `www.tiktok.com`, `web-sg.tiktok.com` | QR/Passport, thông tin tài khoản, API web |
 | `im-api-sg.tiktok.com` | Inbox và dữ liệu hội thoại |
-| `im-ws-va.tiktok.com` | WebSocket nhắn tin |
+| `im-ws-sg.tiktok.com` | WebSocket nhắn tin mặc định |
 | CDN TikTok | Mã hỗ trợ media cũ; không dùng cho tin văn bản theo ngày |
 | `linkmail.wtf` | Dịch vụ upload của plugin mẫu trước đây; đường tải/upload đã bị vô hiệu hóa |
 

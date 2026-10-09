@@ -155,7 +155,7 @@ def cmd_dry_run(config_path: str = DEFAULT_CONFIG_FILE) -> int:
         return 1
 
     try:
-        with open(config_path, "r", encoding="utf-8") as f:
+        with open(config_path, "r", encoding="utf-8-sig") as f:
             cfg = json.load(f)
     except Exception:
         print(f"\n[!] Error parsing JSON in '{config_path}'.")
@@ -261,8 +261,7 @@ def cmd_ws_probe(session_name: str, host: Optional[str] = None) -> int:
         return 0
     except Exception as e:
         if not _report_ws_rejection(e):
-            print(f"\n[!] WebSocket probe failed: {type(e).__name__}: {e}" if isinstance(e, ValueError)
-                  else f"\n[!] WebSocket probe failed: {type(e).__name__}")
+            print(f"\n[!] WebSocket probe failed: {type(e).__name__}")
         return 1
 
 
@@ -279,6 +278,21 @@ def cmd_login() -> int:
         return 0
     except Exception as e:
         print(f"[!] Login error: {type(e).__name__}")
+        return 1
+
+
+def cmd_capture_ws_auth(session_name: str) -> int:
+    """Explicit Windows browser setup; a handshake probe never sends a DM."""
+    if sys.platform != "win32":
+        print("[!] Capture browser auth on Windows; see TERMUX.md for transfer instructions.")
+        return 1
+    try:
+        from ws_auth_capture import capture_session_auth
+        capture_session_auth(session_name)
+        return 0
+    except Exception as exc:
+        print(f"[!] Browser auth setup failed: {type(exc).__name__}.")
+        print("    Check optional requirements-auth-windows.txt and Chromium installation, then retry manually.")
         return 1
 
 
@@ -313,11 +327,17 @@ def cmd_list_conversations(session_name: str) -> int:
         print("-" * 85)
         for i, c in enumerate(convs, 1):
             type_str = "Group" if c.get("is_group") else "Direct"
+            name_str = c.get('name', '')
+            try:
+                name_str.encode(sys.stdout.encoding or 'utf-8')
+            except UnicodeEncodeError:
+                name_str = name_str.encode('ascii', 'replace').decode('ascii')
+
             print(
                 f"{i:<3} {c.get('conv_id', ''):<36} "
                 f"{str(c.get('conv_short_id', 0)):<22} "
                 f"{type_str:<8} "
-                f"{c.get('name', '')}"
+                f"{name_str}"
             )
         print("\nUse the Conv ID and Short ID above in your streak.json config targets.")
         return 0
@@ -408,6 +428,10 @@ def main() -> int:
     probe_parser.add_argument("--session", "-s", required=True, help="Session name to use (required)")
     probe_parser.add_argument("--host", help="Override WS host, e.g. im-ws-sg.tiktok.com (im-ws*.tiktok.com only)")
 
+    subparsers.add_parser("tui", help="Launch the Textual Terminal User Interface")
+    capture_parser = subparsers.add_parser("capture-ws-auth", help="Windows-only browser auth setup for a saved session")
+    capture_parser.add_argument("--session", "-s", required=True)
+
     args = parser.parse_args()
 
     # Reject mode flags with subcommands before any network activity
@@ -422,6 +446,16 @@ def main() -> int:
         return cmd_status(config_path=args.config)
     elif args.command == "ws-probe":
         return cmd_ws_probe(session_name=args.session, host=args.host)
+    elif args.command == "tui":
+        try:
+            from tiktok_tui import TikTokTUI
+        except ModuleNotFoundError:
+            print("[!] Optional TUI dependencies missing: install requirements-tui.txt.")
+            return 1
+        TikTokTUI().run()
+        return 0
+    elif args.command == "capture-ws-auth":
+        return cmd_capture_ws_auth(args.session)
 
     if args.send:
         return cmd_send(config_path=args.config)

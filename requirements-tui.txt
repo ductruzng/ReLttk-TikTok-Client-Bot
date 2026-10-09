@@ -1,0 +1,2 @@
+# Optional Windows configuration UI. Core CLI does not import Textual.
+textual>=8.2.8,<9

@@ -29,7 +29,7 @@ _RE_ACCESS_KEY = re.compile(r"^[0-9a-f]{32}$")
 _RE_TTWID = re.compile(r"^1\|[A-Za-z0-9_-]+\|\d+\|[0-9a-f]+$")
 
 
-def load_ws_auth(path: str | None = None) -> dict:
+def load_ws_auth(path: str | None = None, *, session_name: str | None = None, cookies: dict | None = None) -> dict:
     """Load a browser-issued {ttwid, access_key} pair from the local (gitignored) auth file.
 
     The WS gateway answers "authentication failed" unless access_key matches the ttwid
@@ -37,13 +37,28 @@ def load_ws_auth(path: str | None = None) -> dict:
     """
     import json
     import urllib.parse
+    if session_name is not None:
+        from qrlogin import ws_auth_path
+        path = ws_auth_path(session_name)
     path = path or os.path.join(os.path.dirname(os.path.abspath(__file__)), config.WS_AUTH_FILE)
+    if os.path.islink(path) or os.path.islink(os.path.dirname(os.path.abspath(path))):
+        raise PermissionError("Symlinks are rejected for WS credentials")
     if not os.path.exists(path):
         return {}
-    with open(path, "r", encoding="utf-8") as f:
+    if sys.platform != "win32":
+        os.chmod(os.path.dirname(os.path.abspath(path)), 0o700)
+        os.chmod(path, 0o600)
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    with os.fdopen(fd, "r", encoding="utf-8-sig") as f:
         data = json.load(f)
     if not isinstance(data, dict):
         raise ValueError(f"{config.WS_AUTH_FILE} must contain a JSON object")
+    if session_name is not None:
+        import hashlib
+        sessionid = (cookies or {}).get("sessionid", "")
+        expected_hash = hashlib.sha256(sessionid.encode()).hexdigest()
+        if not sessionid or data.get("session") != session_name or data.get("session_hash") != expected_hash:
+            raise ValueError("WS auth does not match the selected session; capture auth again on Windows")
     ttwid = urllib.parse.unquote(str(data.get("ttwid", "")).strip())
     access_key = str(data.get("access_key", "")).strip().lower()
     if not _RE_TTWID.match(ttwid) or not _RE_ACCESS_KEY.match(access_key):

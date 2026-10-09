@@ -127,7 +127,7 @@ def get_item_detail(item_id: str) -> dict:
         return json.loads(resp.read())
 
 
-def _fetch_inbox(cookies: dict | None = None, device_id: str | None = None, ms_token: str | None = None, verify_fp: str | None = None) -> bytes:
+def _fetch_inbox(sub_command: int, field_6: int, cookies: dict | None = None, device_id: str | None = None, ms_token: str | None = None, verify_fp: str | None = None) -> bytes:
     cookies = cookies or config.COOKIES
     _BV = "5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36 Edg/150.0.0.0"
     _FULL_UA = f"Mozilla/5.0 {_BV}"
@@ -140,11 +140,11 @@ def _fetch_inbox(cookies: dict | None = None, device_id: str | None = None, ms_t
 
     body = (
         _pb_varint(1, 203) +
-        _pb_varint(2, 10002) +
+        _pb_varint(2, sub_command) +
         _pb_str(3, "1.7.0") +
         _pb_str(4, "") +
         _pb_varint(5, 3) +
-        _pb_varint(6, 1) +
+        _pb_varint(6, field_6) +
         _pb_str(7, "3035f17:feat/call-trace-plugin") +
         _pb_bytes(8, _pb_bytes(203, _pb_varint(1, 0))) +
         _pb_str(9, device_id) +
@@ -274,11 +274,63 @@ def _parse_inbox(resp_body: bytes) -> list[dict]:
 
 
 def get_conversations(cookies: dict | None = None, device_id: str | None = None) -> list[dict]:
-    return _parse_inbox(_fetch_inbox(cookies=cookies, device_id=device_id))
+    convs = {}
+
+    # Direct (10001, 0)
+    resp_direct = _fetch_inbox(sub_command=10001, field_6=0, cookies=cookies, device_id=device_id)
+    direct_list = _parse_inbox(resp_direct)
+    for c in direct_list:
+        convs[c["conv_id"]] = c
+
+    # Group (10002, 1)
+    resp_group = _fetch_inbox(sub_command=10002, field_6=1, cookies=cookies, device_id=device_id)
+    group_list = _parse_inbox(resp_group)
+    for c in group_list:
+        convs[c["conv_id"]] = c
+
+    # Resolve Direct names
+    try:
+        own_uid = get_own_user_id(cookies=cookies)
+    except Exception:
+        own_uid = None
+
+    target_uids = []
+    uid_to_conv = {}
+    for c in convs.values():
+        if not c["is_group"]:
+            parts = c["conv_id"].split(":")
+            if len(parts) == 4:
+                u1, u2 = parts[2], parts[3]
+                if own_uid:
+                    target_uid = u2 if own_uid == u1 else u1 if own_uid == u2 else None
+                    if target_uid:
+                        target_uids.append(target_uid)
+                        uid_to_conv[target_uid] = c
+                else:
+                    # If own_uid is not available, we fetch both to be safe
+                    target_uids.extend([u1, u2])
+                    uid_to_conv[u1] = c
+                    uid_to_conv[u2] = c
+
+    # Chunk the profile fetching to avoid URL too long
+    chunk_size = 50
+    for i in range(0, len(target_uids), chunk_size):
+        chunk = target_uids[i:i + chunk_size]
+        try:
+            profiles = get_user_profiles(chunk, cookies=cookies)
+            for p in profiles:
+                uid = p.get("user_id_str") or str(p.get("user_id", ""))
+                nick = p.get("nick_name")
+                if nick and uid in uid_to_conv:
+                    uid_to_conv[uid]["name"] = nick
+        except Exception as e:
+            print(f"[!] Warning: Could not fetch user profiles for chunk: {type(e).__name__}")
+
+    return list(convs.values())
 
 
 def get_group_names(cookies: dict | None = None, device_id: str | None = None) -> dict[str, str]:
-    convs = _parse_inbox(_fetch_inbox(cookies=cookies, device_id=device_id))
+    convs = get_conversations(cookies=cookies, device_id=device_id)
     return {c["conv_id"]: c["name"] for c in convs if c["is_group"] and c["name"] != c["conv_id"]}
 
 

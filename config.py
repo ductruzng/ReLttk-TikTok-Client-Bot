@@ -1,3 +1,4 @@
+import os
 COOKIES: dict = {}
 
 # Base handshake URL as sent by the TikTok web client (www.tiktok.com/messages).
@@ -12,7 +13,10 @@ WS_FPID = "9"
 WS_AID = "1459"
 # Upstream default; only valid together with the upstream author's ttwid
 WS_ACCESS_KEY = "277f7a051d7a540326780c413dbc2b9c"
-WS_AUTH_FILE = "ws_auth.local.json"
+WS_AUTH_FILE = os.environ.get(
+    "TIKTOK_WS_AUTH_FILE",
+    "ws_auth.local.json"
+)
 
 OWN_USER_ID = ""
 DEVICE_ID   = ""

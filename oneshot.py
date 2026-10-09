@@ -19,46 +19,18 @@ from main import validate_config_data
 from qrlogin import load_session
 
 
-_SAFE_RESPONSE_HEADERS = (
-    "handshake-msg", "handshake-status", "x-tt-logid", "server", "content-type", "content-length",
-)
-
-
 def describe_ws_rejection(exc, url: str, headers: list[tuple[str, str]], cookies: dict) -> list[str]:
-    """Summarize a rejected WS upgrade without exposing cookie/token/session values.
-
-    Only names are reported for query params, request headers, and cookies; response
-    headers are whitelisted (Set-Cookie is never included) and values are redacted.
-    """
-    from urllib.parse import urlsplit, parse_qsl
-
-    def _clip(value, limit: int = 200) -> str:
-        text = "".join(ch if ch.isprintable() else "?" for ch in str(value))
-        return _log.redact(text[:limit])
-
+    """Log structural diagnostics only; never server-controlled text or credential values."""
+    from urllib.parse import parse_qsl
     parts = urlsplit(url)
-    lines = [
-        f"endpoint: {parts.hostname}{parts.path}",
-        "query params: " + ", ".join(k for k, _ in parse_qsl(parts.query, keep_blank_values=True)),
-        "request headers: " + ", ".join(k for k, _ in headers),
-        "cookie names: " + ", ".join(sorted(cookies)),
-        f"ttwid present: {bool(cookies.get('ttwid'))}, msToken present: {bool(cookies.get('msToken'))}",
-    ]
     response = getattr(exc, "response", None)
-    if response is None:
-        lines.append("response: unavailable")
-        return lines
-    lines.append(f"response: {getattr(response, 'status_code', '?')} {_clip(getattr(response, 'reason_phrase', ''), 60)}")
-    resp_headers = getattr(response, "headers", None)
-    if resp_headers is not None:
-        for name in _SAFE_RESPONSE_HEADERS:
-            value = resp_headers.get(name)
-            if value:
-                lines.append(f"response header {name}: {_clip(value)}")
-    body = getattr(response, "body", None)
-    if body:
-        lines.append(f"response body ({len(body)} bytes): {_clip(body.decode('utf-8', errors='replace'))}")
-    return lines
+    status = getattr(response, "status_code", None)
+    return [
+        f"endpoint: {parts.hostname}{parts.path}",
+        "query params: " + ", ".join(k for k, _ in parse_qsl(parts.query)),
+        f"ttwid present: {bool(cookies.get('ttwid'))}, msToken present: {bool(cookies.get('msToken'))}",
+        f"response: {status if type(status) is int else 'unavailable'}",
+    ]
 
 
 def validate_against_server_inbox(cookies: dict, targets: list[dict], device_id: str | None = None) -> None:
@@ -240,16 +212,15 @@ def with_ws_host(url: str, host: str) -> str:
     return urlunsplit(parts._replace(netloc=host))
 
 
-def _prepare_ws(cookies: dict) -> tuple[dict, str]:
-    """Apply the local browser ttwid/access_key pair (if any) and build the handshake URL."""
-    ws_auth = load_ws_auth()
-    if ws_auth:
-        _log.info("oneshot", f"WS auth: using ttwid/access_key pair from {config.WS_AUTH_FILE}")
-    else:
-        _log.warn("oneshot", f"WS auth: {config.WS_AUTH_FILE} not found; using built-in access_key, "
-                             "which only matches the upstream ttwid and will likely be rejected")
+def _prepare_ws(cookies: dict, session_name: str, ws_auth: dict | None = None) -> tuple[dict, str]:
+    """Use only auth bound to this saved session, or an explicit in-memory capture candidate."""
+    if ws_auth is None:
+        ws_auth = load_ws_auth(session_name=session_name, cookies=cookies)
+    if not ws_auth:
+        _log.error("oneshot", "Missing session-bound auth. Run capture-ws-auth on Windows; see TERMUX.md.")
+        raise ValueError("Missing session-bound WS auth; run capture-ws-auth on Windows (see TERMUX.md)")
     ws_cookies = apply_ws_auth(cookies, ws_auth)
-    return ws_cookies, build_ws_url(ws_cookies, access_key=ws_auth.get("access_key"))
+    return ws_cookies, build_ws_url(ws_cookies, access_key=ws_auth["access_key"])
 
 
 async def _open_ws(cookies: dict, ws_url: str):
@@ -291,7 +262,7 @@ async def _open_ws(cookies: dict, ws_url: str):
         raise
 
 
-async def probe_ws_handshake(session_name: str, host: str | None = None) -> None:
+async def probe_ws_handshake(session_name: str, host: str | None = None, *, ws_auth: dict | None = None) -> None:
     """Handshake-only diagnostic: connect, then close immediately.
 
     Sends no frames at all (not even the "hi" ping), touches no ledger and reads no
@@ -300,7 +271,7 @@ async def probe_ws_handshake(session_name: str, host: str | None = None) -> None
     cookies = load_session(session_name)
     if not cookies or not cookies.get("sessionid"):
         raise ValueError(f"Session '{session_name}' not found or missing sessionid cookie.")
-    ws_cookies, ws_url = _prepare_ws(cookies)
+    ws_cookies, ws_url = _prepare_ws(cookies, session_name, ws_auth)
     if host:
         ws_url = with_ws_host(ws_url, host)
     connection = await _open_ws(ws_cookies, ws_url)
@@ -318,7 +289,7 @@ async def run_oneshot_send(
     if not os.path.exists(config_path):
         raise FileNotFoundError(f"Configuration file not found: {config_path}")
 
-    with open(config_path, "r", encoding="utf-8") as f:
+    with open(config_path, "r", encoding="utf-8-sig") as f:
         cfg = json.load(f)
 
     if not isinstance(cfg, dict):
@@ -350,7 +321,7 @@ async def run_oneshot_send(
     # Acquire process run lock
     with ledger.RunLock():
         results = []
-        connection = await _open_ws(*_prepare_ws(cookies))
+        connection = await _open_ws(*_prepare_ws(cookies, session_name))
         async with connection as ws:
             _log.ok("oneshot", "Connected to WebSocket. Processing targets sequentially...")
             # Handshake ping

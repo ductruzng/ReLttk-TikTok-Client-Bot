@@ -2,7 +2,9 @@
 
 This project uses **unofficial, reverse-engineered TikTok internal APIs**. Whether
 messages sent by this bot count towards TikTok streaks **has not been verified**.
-The network protocol, QR login and Android deployment remain unverified live.
+The network protocol, QR login and Android deployment remain unverified live in
+this safety review. **CLI is the primary runtime on Termux; the Windows TUI is
+an optional configuration interface.**
 
 ## Default: offline dry-run
 
@@ -42,13 +44,42 @@ These commands contact TikTok; they are not part of dry-run or offline tests:
 
 ```sh
 python main.py login
+python main.py capture-ws-auth --session my_account
 python main.py list-conversations --session my_account
 python main.py --config streak.local.json --send
 ```
 
 Login requires an interactive terminal for QR display. No QR URL fallback is
 printed. `--send` and `--dry-run` are mutually exclusive; neither can be combined
-with a subcommand. There is no scheduler installed or enabled.
+with a subcommand. On Windows, login attempts optional headless Chromium auth
+capture after saving the session. `capture-ws-auth` refreshes auth for an existing
+session: it launches a browser, probes a WebSocket handshake without sending any
+DM, then saves the matching pair. This setup step is **not browser-free**.
+
+Install core requirements first. Optional Windows components are separate:
+
+```sh
+python -m pip install -r requirements.txt
+python -m pip install -r requirements-tui.txt
+python -m pip install -r requirements-auth-windows.txt
+python -m playwright install chromium
+python -B main.py tui
+```
+
+TUI inbox sync and QR login require explicit button presses. Plan edits do not
+send. The manual send button sends the **saved** plan, not unsaved selections.
+Its optional scheduler defaults off and only runs while the TUI remains open;
+it triggers in the configured minute, without catch-up after sleep/closure.
+Saving an enabled schedule explicitly permits future sends, including after
+reopening the TUI. Neither CLI nor installation enables a scheduler. No cron,
+Tasker or Termux:Boot job is installed by this project.
+
+Auth is stored in `sesion/ws-auth/<session>.json` and bound to the session cookie
+fingerprint. A changed login requires recapture. The old global
+`ws_auth.local.json` and persistent browser profile are **not used by the one-shot
+sender**; old files are left untouched. Recapture on Windows instead of renaming
+an unbound file. Transfer the matching session/auth pair privately to Termux as
+described in TERMUX.md. Missing/mismatched auth stops before opening WebSocket.
 
 Live connectivity is **not ready to be assumed working**: old embedded sample
 session tokens were removed, and device/SDK/signature parameters in the inherited
@@ -66,6 +97,8 @@ into tracked source files to work around a failed connection.
 - A timeout or error is `failed_unknown`, with no retry that day. A crash-left
   `pending` blocks later dates too, until manually reviewed. Cross-midnight
   confirmation/failure also reserves the later date conservatively.
+- There is no force-send option or quota bypass. Failed/unknown and pending
+  records are not deleted to allow another attempt.
 - This limit is local to one ledger. It cannot cover another device, deleted
   state, or messages sent manually in the TikTok app. Keep the phone clock correct.
 - Dry-run does not inspect quota because it never authenticates or reads state.
@@ -74,13 +107,15 @@ into tracked source files to work around a failed connection.
 ## Security and services
 
 QR login uses `www.tiktok.com` and `web-sg.tiktok.com`; inbox/profile APIs also use
-`im-api-sg.tiktok.com`; messaging uses `im-ws-va.tiktok.com` over verified TLS.
+`im-api-sg.tiktok.com`; messaging defaults to `im-ws-sg.tiktok.com` over verified TLS.
 Signing runs locally. Legacy media helpers reference TikTok media CDNs. Sample
 plugins and stranger auto-accept are disabled by default; the former video upload
 plugin to `linkmail.wtf` is inert and has no download/upload implementation.
 
 Sessions are **plaintext** JSON in `sesion/`, with directory mode 0700 and file
-mode 0600 on POSIX. Writes are atomic; permission failures stop access. Windows
+mode 0600 on POSIX, including session-bound WS auth. Writes are atomic; permission
+failures stop access. Browser capture uses a fresh non-persistent context and
+keeps the candidate in memory until a successful probe. Windows
 `chmod` does not configure NTFS ACLs. Use a private user directory. Cookies,
 sessions, state, local plans and logs are ignored by Git. Authentication errors
 omit raw responses; log filtering additionally redacts sensitive values.
@@ -98,6 +133,9 @@ python -m pip check
 
 Tests use temporary files, synthetic messages and fake WebSockets. They do not
 prove TikTok accepts the current protocol or credits streaks.
+The optional TUI smoke test is skipped when Textual is absent. Tested locally on
+Windows/Python 3.10 with Textual 8.2.8 and Playwright 1.63.0 installed; browser
+capture and live TikTok operations were not run.
 
 ## License
 
