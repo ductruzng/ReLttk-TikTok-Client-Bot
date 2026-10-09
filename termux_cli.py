@@ -222,7 +222,14 @@ def menu_check_connection():
 def menu_send_manual():
     print("\n--- [8] Gửi thử thủ công ---")
     print("CẢNH BÁO: Hành động này sẽ gửi tin nhắn thật lên server TikTok!")
-    confirm = input("Bạn có chắc chắn muốn gửi? (yes/no): ").strip().lower()
+    
+    while True:
+        confirm = input("Bạn có chắc chắn muốn gửi? (yes/no): ").strip().lower()
+        if confirm in ["yes", "no"]:
+            break
+        if confirm == "":
+            continue # Ignore stray newlines
+            
     if confirm == "yes":
         from tui_services import summarize_results
         try:

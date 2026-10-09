@@ -75,10 +75,11 @@ async def capture_cdp_auth() -> Optional[tuple[str, str]]:
                         
                         access_key = params.get("access_key", [None])[0]
                         ttwid = params.get("ttwid", [None])[0]
+                        device_id = params.get("device_id", [None])[0]
                         
                         if access_key and ttwid:
                             print("[+] Đã bắt được WebSocket Auth (ttwid & access_key).")
-                            return (ttwid, access_key)
+                            return (ttwid, access_key, device_id)
                         else:
                             print("[-] Bắt được WS nhưng thiếu access_key hoặc ttwid. Đang chờ tiếp...")
     except websockets.exceptions.ConnectionClosed:
@@ -105,8 +106,10 @@ def run_capture(session_name: str):
         print("[!] Không thu thập được Auth. Hủy thao tác.")
         return
         
-    ttwid, access_key = pair
+    ttwid, access_key, device_id = pair
     auth_candidate = {"ttwid": ttwid, "access_key": access_key}
+    if device_id:
+        auth_candidate["device_id"] = device_id
     
     # 2. Verify with ws-probe in memory (no overwrite yet)
     print("\n[*] Đang kiểm chứng Auth thu thập được (ws-probe)...")

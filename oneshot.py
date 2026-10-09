@@ -74,6 +74,7 @@ async def _send_target_oneshot(
     message_text: str,
     timeout_seconds: float = 20.0,
     db_path: str = ledger._DEFAULT_LEDGER_PATH,
+    device_id: str | None = None,
 ) -> dict:
     """Execute durable reservation, transmission, and correlated echo confirmation for one target."""
     conv_id = target["conv_id"]
@@ -104,7 +105,7 @@ async def _send_target_oneshot(
         conv_id=conv_id,
         short_id=conv_short_id,
         text=message_text,
-        device_id=config.DEVICE_ID,
+        device_id=device_id or config.DEVICE_ID,
         sdk_ms_token=config.MSG_SDK_MS_TOKEN,
         tt_public_key=config.TT_PUBLIC_KEY,
         tt_client_data=config.TT_CLIENT_DATA,
@@ -315,13 +316,19 @@ async def run_oneshot_send(
 
     _log.info("oneshot", f"Authenticated canonical UID: {canonical_uid}")
 
+    _log.info("oneshot", f"Authenticated canonical UID: {canonical_uid}")
+
+    # Extract device_id bound to this WS auth if available
+    ws_auth = load_ws_auth(session_name=session_name, cookies=cookies)
+    effective_device_id = ws_auth.get("device_id") if ws_auth else config.DEVICE_ID
+
     if validate_server:
-        validate_against_server_inbox(cookies, targets, device_id=config.DEVICE_ID)
+        validate_against_server_inbox(cookies, targets, device_id=effective_device_id)
 
     # Acquire process run lock
     with ledger.RunLock():
         results = []
-        connection = await _open_ws(*_prepare_ws(cookies, session_name))
+        connection = await _open_ws(*_prepare_ws(cookies, session_name, ws_auth))
         async with connection as ws:
             _log.ok("oneshot", "Connected to WebSocket. Processing targets sequentially...")
             # Handshake ping
@@ -339,6 +346,7 @@ async def run_oneshot_send(
                     message_text=message_text,
                     timeout_seconds=timeout_seconds,
                     db_path=db_path,
+                    device_id=effective_device_id,
                 )
                 results.append(res)
 
