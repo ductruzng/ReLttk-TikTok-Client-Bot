@@ -1,8 +1,38 @@
 __pycache__/
 *.pyc
 *.pyo
+
+# Sessions and credentials
 sesion/
+sessions/
+cookies*.json
 .uid_cache.json
-.vscode/
-messages.db
+
+# SQLite databases and WAL sidecars
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+state/
+.state/
+
+# Personal config and local overrides
+streak.local.json
+config.local.py
+personal_config.json
+
+# Logs and runtime artifacts
+*.log
+logs/
 stickers/
+.vscode/
+
+# QR images
+*.png
+qr*.png
+
+# Virtual environments and temporary work directories
+venv/
+.venv/
+work/
+verify-venv/

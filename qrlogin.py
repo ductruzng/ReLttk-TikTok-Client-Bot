@@ -1,21 +1,29 @@
 import http.cookiejar
 import json
 import os
+import re
+import secrets
 import sys
 import threading
 import time
 
 try:
     from . import log as _log
+    from .core.signer_client import sign_full
+    from . import config as _cfg_mod
+    from .core import api as _api_mod
 except ImportError:
     import log as _log
+    from core.signer_client import sign_full
+    import config as _cfg_mod
+    import core.api as _api_mod
 
 _stop_event = threading.Event()
 import urllib.parse
 import urllib.request
 
 
-                                                                               
+
 _AID       = "1459"
 _UA        = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36"
 _VERIFY_FP = "verify_mplnlgno_s07vIKFn_2ii8_43lR_800G_hibLVGVaQnut"
@@ -23,7 +31,7 @@ _REGION    = "CO"
 _LANG      = "es-419"
 
 _SESSION_DIR    = os.path.join(os.path.dirname(__file__), "sesion")
-_SEED_MS_TOKEN  = "n8VdIat8AnERg_j9aNTiWJAHodoWYeC4bFBiz8RqtURuz_RdFacc_r5w85R1o2oGXsqaWRvXDZkdq6u4ywHT8DMXuJ5XapDs70Tjl_Fz-rnvfNEUDfvlJglps5crqgNnRtxhw4Ez"
+_SEED_MS_TOKEN = ""  # Never reuse a session token embedded in source control.
 
 _SHARK_EXTRA_TMPL = (
     '{{"aid":{aid},"app_name":"Tik_Tok_Login","channel":"tiktok_web",'
@@ -40,8 +48,6 @@ _SHARK_EXTRA_TMPL = (
 
 
 def _sign(query: str) -> str:
-    from importlib import import_module
-    sign_full = import_module(f"{_pkg_name()}.core.signer_client").sign_full
     qs = query.rstrip("&").removesuffix("msToken=").rstrip("&")
     signed, x_gnarly = sign_full(qs, ua=_UA)
     return f"{signed}&X-Gnarly={urllib.parse.quote(x_gnarly, safe='')}"
@@ -118,8 +124,8 @@ def _fetch_ms_token(did: str) -> str:
                     if part.startswith("msToken=") and len(part) > len("msToken="):
                         return part[len("msToken="):]
             return ""
-        except Exception as e:
-            _log.error("qrlogin", f"store_region intento {attempt + 1}/2 fallo: {e}")
+        except Exception:
+            _log.error("qrlogin", f"store_region intento {attempt + 1}/2 fallo (NETWORK_ERROR)")
     return ""
 
 
@@ -159,14 +165,17 @@ def _shorten_url(opener, index_url: str, did: str) -> str:
     with opener.open(req, timeout=10) as resp:
         data = json.loads(resp.read())
     if data.get("code") != 0:
-        raise RuntimeError(f"shorten fallo: {data}")
+        raise RuntimeError("SHORTEN_FAILED")
     entries = data.get("data", [])
     if not entries:
-        raise RuntimeError("shorten: respuesta vacia")
+        raise RuntimeError("SHORTEN_EMPTY_RESPONSE")
     return entries[0]["short_url"]
 
 
 def _print_qr(url: str):
+    if not sys.stdout.isatty():
+        _log.warn("qrlogin", "QR terminal display requires an interactive terminal.")
+        return
     try:
         import qrcode
         qr = qrcode.QRCode(border=1)
@@ -174,46 +183,142 @@ def _print_qr(url: str):
         qr.make(fit=True)
         qr.print_ascii(invert=True)
     except ImportError:
-        _log.warn("qrlogin", "instala qrcode: pip install qrcode")
-        _log.info("qrlogin", f"URL: {url}")
+        _log.warn("qrlogin", "instala qrcode para visualización en terminal: pip install qrcode")
 
 
-def _write_cookies(cookies: dict, username: str = "_temp"):
-    os.makedirs(_SESSION_DIR, exist_ok=True)
-    path = os.path.join(_SESSION_DIR, f"{username}.json")
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(cookies, f, indent=2)
-    return path
+def _validate_session_name(username: str) -> str:
+    if not username or not isinstance(username, str):
+        raise ValueError("Session username must be a non-empty string")
+    if "/" in username or "\\" in username or "\0" in username or ".." in username:
+        raise ValueError(f"Invalid session username '{username}': path traversal characters are rejected")
+    if not re.match(r'^[a-zA-Z0-9_\.-]+$', username):
+        raise ValueError(f"Invalid session username '{username}': contains disallowed characters")
+    return username
+
+
+def _ensure_session_dir() -> None:
+    if os.path.exists(_SESSION_DIR) and os.path.islink(_SESSION_DIR):
+        raise PermissionError(f"Symlinks are rejected for session directory: {_SESSION_DIR}")
+    os.makedirs(_SESSION_DIR, mode=0o700, exist_ok=True)
+    if hasattr(os, "chmod") and sys.platform != "win32":
+        os.chmod(_SESSION_DIR, 0o700)
+
+
+def _get_session_path(username: str) -> str:
+    clean_name = _validate_session_name(username)
+    _ensure_session_dir()
+    target_path = os.path.abspath(os.path.join(_SESSION_DIR, f"{clean_name}.json"))
+    abs_session_dir = os.path.abspath(_SESSION_DIR)
+    if os.path.commonpath([abs_session_dir, target_path]) != abs_session_dir:
+        raise PermissionError(f"Session path escape detected: {target_path}")
+    if os.path.exists(target_path) and os.path.islink(target_path):
+        raise PermissionError(f"Symlinks are rejected for session files: {target_path}")
+    return target_path
+
+
+def _write_cookies(cookies: dict, username: str = "_temp") -> str:
+    """Atomic write of session cookies with exclusive temporary creation and POSIX 0600 permissions.
+
+    POSIX chmod errors fail closed.
+    Note: On Windows, chmod does not configure NTFS ACLs; Windows security relies
+    on standard user profile directory ACL isolation.
+    """
+    _ensure_session_dir()
+    path = _get_session_path(username)
+    if os.path.exists(path) and os.path.islink(path):
+        raise PermissionError(f"Symlinks are rejected for session files: {path}")
+
+    tmp_path = None
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+
+    try:
+        while True:
+            candidate_tmp = os.path.join(_SESSION_DIR, f".tmp_{secrets.token_hex(8)}.json")
+            try:
+                fd = os.open(candidate_tmp, flags, 0o600)
+                tmp_path = candidate_tmp
+                break
+            except FileExistsError:
+                continue
+
+        try:
+            content = json.dumps(cookies, indent=2).encode("utf-8")
+            total = 0
+            while total < len(content):
+                written = os.write(fd, content[total:])
+                if written <= 0:
+                    raise OSError("Session write made no progress")
+                total += written
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+        if hasattr(os, "chmod") and sys.platform != "win32":
+            os.chmod(tmp_path, 0o600)
+
+        os.replace(tmp_path, path)
+        tmp_path = None
+
+        if hasattr(os, "chmod") and sys.platform != "win32":
+            os.chmod(path, 0o600)
+
+        return path
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
 
 
 def load_session(username: str) -> dict:
-    path = os.path.join(_SESSION_DIR, f"{username}.json")
+    """Load session cookies, tightening permissions on read (0600 on POSIX)."""
     try:
-        with open(path, encoding="utf-8") as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
+        path = _get_session_path(username)
+    except (ValueError, PermissionError):
+        return {}
+
+    if not os.path.exists(path):
+        return {}
+    if os.path.islink(path):
+        raise PermissionError(f"Symlinks are rejected for session file: {path}")
+
+    # Tighten permissions on read
+    if hasattr(os, "chmod") and sys.platform != "win32":
+        os.chmod(path, 0o600)
+
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+
+    try:
+        fd = os.open(path, flags)
+        try:
+            with open(fd, "r", encoding="utf-8", closefd=False) as f:
+                return json.load(f)
+        finally:
+            os.close(fd)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
         return {}
 
 
 def list_sessions() -> list[str]:
+    _ensure_session_dir()
     try:
         return [
-            f[:-5] for f in os.listdir(_SESSION_DIR) if f.endswith(".json")
+            f[:-5] for f in os.listdir(_SESSION_DIR)
+            if f.endswith(".json") and not f.startswith(".") and not os.path.islink(os.path.join(_SESSION_DIR, f))
         ]
-    except FileNotFoundError:
+    except (FileNotFoundError, OSError):
         return []
-
-
-def _pkg_name() -> str:
-    return os.path.basename(os.path.dirname(os.path.abspath(__file__)))
 
 
 def run(did: str | None = None):
     if did is None:
         try:
-            from importlib import import_module
-            _cfg = import_module(f"{_pkg_name()}.config")
-            did = getattr(_cfg, "DEVICE_ID", None) or None
+            did = getattr(_cfg_mod, "DEVICE_ID", None) or None
         except Exception:
             pass
     if not did:
@@ -236,24 +341,24 @@ def run(did: str | None = None):
     sessionid = cookies.get("sessionid", "")
     if not sessionid:
         _log.warn("qrlogin", "advertencia: no se encontro sessionid")
-        _log.warn("qrlogin", f"cookies recibidas: {list(cookies.keys())}")
         return
 
-    _log.ok("qrlogin", f"sesion obtenida: {sessionid[:8]}...")
+    _log.ok("qrlogin", "sesion obtenida correctamente")
 
-    username = f"session_{sessionid[:8]}"
+    # Use random fallback name, never expose session id or token prefixes
+    username = f"user_{secrets.token_hex(6)}"
     try:
-        from importlib import import_module
-        _api = import_module(f"{_pkg_name()}.core.api")
-        uid = _api.get_own_user_id(cookies=cookies)
-        profiles = _api.get_user_profiles([uid], cookies=cookies)
+        uid = _api_mod.get_own_user_id(cookies=cookies)
+        profiles = _api_mod.get_user_profiles([uid], cookies=cookies)
         if profiles:
-            username = profiles[0].get("unique_id") or username
+            candidate_user = profiles[0].get("unique_id")
+            if candidate_user and re.match(r'^[a-zA-Z0-9_\.-]+$', candidate_user):
+                username = candidate_user
     except Exception as e:
-        _log.warn("qrlogin", f"no se pudo obtener username ({e}), usando '{username}'")
+        _log.warn("qrlogin", f"no se pudo obtener username ({type(e).__name__}), usando identificador seguro")
 
     path = _write_cookies(cookies, username)
-    _log.ok("qrlogin", f"sesion guardada: {path}")
+    _log.ok("qrlogin", f"sesion guardada exitosamente: {username}")
 
 
 def _handle_2fa(opener, passport_ticket: str) -> bool:
@@ -286,37 +391,38 @@ def _handle_2fa(opener, passport_ticket: str) -> bool:
     try:
         r = _post("challenge_type=2&action=3")
         if r.get("message") != "success":
-            _log.error("qrlogin", f"2FA: error enviando código: {r}")
+            _log.error("qrlogin", "2FA: error enviando codigo (AUTH_ERROR)")
             return False
-        _log.ok("qrlogin", "2FA: código enviado al email/teléfono registrado")
+        _log.ok("qrlogin", "2FA: codigo enviado al email/telefono registrado")
     except Exception as e:
-        _log.error("qrlogin", f"2FA: error en action=3: {e}")
+        _log.error("qrlogin", f"2FA: error en action=3 ({type(e).__name__})")
         return False
 
-    code = input("[qrlogin] ingresa el código de verificación: ").strip()
+    import getpass
+    code = getpass.getpass("[qrlogin] ingresa el codigo de verificacion (2FA): ").strip()
     if not code:
-        _log.error("qrlogin", "2FA: código vacío, cancelando")
+        _log.error("qrlogin", "2FA: codigo vacio, cancelando")
         return False
 
     hex_code = code.encode().hex()
     try:
         r = _post(f"challenge_type=2&action=4&mix_mode=1&fixed_mix_mode=1&code={urllib.parse.quote(hex_code)}")
         if r.get("message") != "success":
-            _log.error("qrlogin", f"2FA: código incorrecto: {r}")
+            _log.error("qrlogin", "2FA: codigo incorrecto (AUTH_ERROR)")
             return False
-        _log.ok("qrlogin", "2FA: verificación exitosa")
+        _log.ok("qrlogin", "2FA: verificacion exitosa")
         return True
     except Exception as e:
-        _log.error("qrlogin", f"2FA: error en action=4: {e}")
+        _log.error("qrlogin", f"2FA: error en action=4 ({type(e).__name__})")
         return False
 
 
 def _try_login(did: str) -> dict | None:
-                                        
+
     jar = http.cookiejar.CookieJar()
     opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
 
-                                                                 
+
     req = urllib.request.Request("https://www.tiktok.com/login/qrcode", headers={
         "User-Agent": _UA,
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -325,10 +431,10 @@ def _try_login(did: str) -> dict | None:
     })
     try:
         opener.open(req, timeout=10)
-    except Exception as e:
-        _log.warn("qrlogin", f"advertencia cargando pagina inicial: {e}")
+    except Exception:
+        _log.warn("qrlogin", "advertencia cargando pagina inicial (NETWORK_ERROR)")
 
-                      
+
     _log.info("qrlogin", "obteniendo codigo QR...")
     data = None
     for attempt in range(2):
@@ -359,21 +465,21 @@ def _try_login(did: str) -> dict | None:
                 data = json.loads(resp.read())
             break
         except Exception as e:
-            _log.error("qrlogin", f"get_qrcode intento {attempt + 1}/2 fallo: {e}")
+            _log.error("qrlogin", f"get_qrcode intento {attempt + 1}/2 fallo ({type(e).__name__})")
             if attempt == 1:
                 return None
 
     if data is None or data.get("message") != "success":
-        raise RuntimeError(f"get_qrcode fallo: {data}")
+        raise RuntimeError("GET_QRCODE_FAILED")
 
     token = data["data"]["token"]
     index_url = data["data"]["qrcode_index_url"]
 
-                    
+
     try:
         short_url = _shorten_url(opener, index_url, did)
-    except Exception as e:
-        _log.warn("qrlogin", f"no se pudo acortar URL ({e}), usando URL original")
+    except Exception:
+        _log.warn("qrlogin", "no se pudo acortar URL, usando URL original")
         short_url = index_url
 
     _log.info("qrlogin", "escanea este QR con TikTok:\n")
@@ -382,7 +488,7 @@ def _try_login(did: str) -> dict | None:
 
     ms_token = _fetch_ms_token(did) or next((c.value for c in jar if c.name == "msToken"), "")
 
-                
+
     status_shown = set()
     cookies = {}
     try:
@@ -420,7 +526,7 @@ def _try_login(did: str) -> dict | None:
             except KeyboardInterrupt:
                 raise
             except Exception as e:
-                _log.error("qrlogin", f"error en check_qrconnect: {e}")
+                _log.error("qrlogin", f"error en check_qrconnect ({type(e).__name__})")
                 time.sleep(2)
                 continue
 
@@ -449,12 +555,12 @@ def _try_login(did: str) -> dict | None:
                         _log.error("qrlogin", "2FA requerida pero no se pudo obtener passport_ticket")
                         _stop_event.wait(3)
                         continue
-                    _log.warn("qrlogin", "2FA requerida (verificación de identidad)")
+                    _log.warn("qrlogin", "2FA requerida (verificacion de identidad)")
                     ok = _handle_2fa(opener, passport_ticket)
                     if not ok:
                         return None
                     continue
-                _log.error("qrlogin", f"{data.get('data', {}).get('description', data)}, reintentando...")
+                _log.error("qrlogin", "Verificacion requerida, reintentando...")
                 _stop_event.wait(3)
                 continue
 

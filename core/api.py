@@ -5,7 +5,10 @@ import re
 import urllib.request
 import urllib.parse
 
-from .. import config
+try:
+    from .. import config
+except ImportError:
+    import config
 
 _ROOT = os.path.dirname(os.path.dirname(__file__))
 _UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36"
@@ -83,10 +86,7 @@ def get_fyp_video() -> str:
 
 
 def get_item_detail(item_id: str) -> dict:
-    import sys
-    sys.path.insert(0, os.path.join(os.path.expanduser("~"), "Documents", "ttsigner"))
-    from Web.bogus import Signer
-    from Web.gnarly import get_X_Gnarly
+    from .signer_client import sign_bogus, sign_gnarly
 
     odin_id = config.COOKIES.get("odin_tt", "")[:19] or config.OWN_USER_ID
     ms_token = config.COOKIES.get("msToken", "")
@@ -112,8 +112,8 @@ def get_item_detail(item_id: str) -> dict:
         f"&msToken={urllib.parse.quote(ms_token)}"
     )
 
-    signed_query = Signer.sign(query, _UA)
-    x_gnarly = get_X_Gnarly(query_string=query, request_body="", user_agent=_UA)
+    signed_query = sign_bogus(query, _UA)
+    x_gnarly = sign_gnarly(query, "", _UA)
     url = f"https://www.tiktok.com/api/item/detail/?{signed_query}&X-Gnarly={x_gnarly}"
 
     req = urllib.request.Request(url, headers={
@@ -247,7 +247,8 @@ def _parse_inbox(resp_body: bytes) -> list[dict]:
                 conv_id = _str(conv, 1)
                 if not conv_id:
                     continue
-                conv_type = conv.get(3, [1])[0] if conv.get(3) else 1
+                conv_type = int(conv.get(3, [1])[0]) if conv.get(3) else 1
+                conv_short_id = int(conv.get(2, [0])[0]) if conv.get(2) else 0
                 is_group = (conv_type == 2)
                 member_count = conv.get(7, [0])[0]
                 unread = conv.get(11, [0])[0]
@@ -260,12 +261,14 @@ def _parse_inbox(resp_body: bytes) -> list[dict]:
                     a = _str(f50, 7)
                     if a: avatar = a
                 convs.append({
-                    "conv_id":      conv_id,
-                    "name":         name,
-                    "is_group":     is_group,
-                    "unread":       unread,
-                    "member_count": member_count,
-                    "avatar":       avatar,
+                    "conv_id":       conv_id,
+                    "conv_short_id": conv_short_id,
+                    "conv_type":     conv_type,
+                    "name":          name,
+                    "is_group":      is_group,
+                    "unread":        unread,
+                    "member_count":  member_count,
+                    "avatar":        avatar,
                 })
     return convs
 
@@ -280,10 +283,7 @@ def get_group_names(cookies: dict | None = None, device_id: str | None = None) -
 
 
 def get_music_detail(music_id: str) -> dict:
-    import sys
-    sys.path.insert(0, os.path.join(os.path.expanduser("~"), "Documents", "ttsigner"))
-    from Web.bogus import Signer
-    from Web.gnarly import get_X_Gnarly
+    from .signer_client import sign_bogus, sign_gnarly
 
     ms_token = config.COOKIES.get("msToken", "")
 
@@ -307,8 +307,8 @@ def get_music_detail(music_id: str) -> dict:
         f"&msToken={urllib.parse.quote(ms_token)}"
     )
 
-    signed_query = Signer.sign(query, _UA)
-    x_gnarly = get_X_Gnarly(query_string=query, request_body="", user_agent=_UA)
+    signed_query = sign_bogus(query, _UA)
+    x_gnarly = sign_gnarly(query, "", _UA)
     url = f"https://www.tiktok.com/api/music/detail/?{signed_query}&X-Gnarly={x_gnarly}"
 
     req = urllib.request.Request(url, headers={
@@ -323,11 +323,17 @@ def get_music_detail(music_id: str) -> dict:
 
 
 def _varint(v: int) -> bytes:
+    if isinstance(v, bool) or not isinstance(v, int):
+        raise TypeError(f"Varint must be an integer, got {type(v).__name__}")
+    if v < 0 or v > 0xFFFFFFFFFFFFFFFF:
+        raise ValueError(f"Varint value out of bounds [0, 2^64-1]: {v}")
     out = []
     while True:
-        b = v & 0x7F; v >>= 7
+        b = v & 0x7F
+        v >>= 7
         out.append(b | (0x80 if v else 0))
-        if not v: break
+        if not v:
+            break
     return bytes(out)
 
 def _pb_varint(field: int, v: int) -> bytes:

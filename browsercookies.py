@@ -15,31 +15,23 @@ _CHROMIUM_PATHS = {
 _FIREFOX_PROFILES = os.path.expandvars(r"%APPDATA%\Mozilla\Firefox\Profiles")
 
 
-_BROWSER_PROCS = {
-    "chrome":  "chrome",
-    "brave":   "brave",
-    "edge":    "msedge",
-    "firefox": "firefox",
-}
+import sys
+
+if sys.platform != "win32":
+    raise NotImplementedError(
+        "Browser cookie extraction is not supported on Android / Termux or non-Windows platforms. "
+        "Please use QR login or transfer an existing session."
+    )
 
 def _read_locked_file(path: str, browser: str) -> bytes:
     try:
         with open(path, "rb") as f:
             return f.read()
     except PermissionError:
-        pass
-
-    import subprocess, time
-    proc = _BROWSER_PROCS.get(browser)
-    if proc:
-        subprocess.run(["taskkill", "/F", "/IM", f"{proc}.exe"], capture_output=True)
-        time.sleep(1.5)
-
-    try:
-        with open(path, "rb") as f:
-            return f.read()
-    except PermissionError:
-        raise PermissionError(f"no se pudo leer el archivo de cookies de {browser}")
+        raise PermissionError(
+            f"No se pudo leer el archivo de cookies de {browser} porque esta en uso por el navegador. "
+            f"Por favor cierra el navegador e intenta de nuevo."
+        ) from None
 
 
 def _get_chromium_key(browser: str) -> bytes:

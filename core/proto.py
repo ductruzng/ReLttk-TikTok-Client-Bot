@@ -26,7 +26,10 @@ REACTIONS = {
 
 
 def encode_varint(v: int) -> bytes:
-    v = int(v)
+    if isinstance(v, bool) or not isinstance(v, int):
+        raise TypeError(f"Varint must be an integer, got {type(v).__name__}")
+    if v < 0 or v > 0xFFFFFFFFFFFFFFFF:
+        raise ValueError(f"Varint value out of bounds [0, 2^64-1]: {v}")
     out = []
     while True:
         bits = v & 0x7F
@@ -101,14 +104,21 @@ def _build_video_share_body(conv_id: str, short_id: int, item_detail: dict,
 
 def _build_msg_body(conv_id: str, short_id: int, text: str, client_id: str,
                     quote: dict | None = None, is_group: bool = False,
-                    awe_type: int | None = None) -> bytes:
-    if is_group:
+                    awe_type: int | None = None, conv_type: int | None = None) -> bytes:
+    short_id = int(short_id)
+    if short_id <= 0:
+        raise ValueError(f"conversation_short_id must be a positive integer, got: {short_id}")
+
+    if conv_type is None:
+        conv_type = 2 if is_group else 1
+
+    if is_group or conv_type == 2:
         awe = 703 if quote else 0
         content_str = json.dumps({"aweType": awe, "text": text}, separators=(',', ':'))
         body = (
             f_str(1, conv_id) +
             f_varint(2, 2) +
-            f_varint(3, int(conv_id)) +
+            f_varint(3, short_id) +
             f_str(4, content_str) +
             f_bytes(5, f_str(1, "s:mentioned_users")   + f_str(2, "")) +
             f_bytes(5, f_str(1, "s:client_message_id") + f_str(2, client_id)) +
@@ -147,19 +157,17 @@ def _build_msg_body(conv_id: str, short_id: int, text: str, client_id: str,
             "refmsg_template_quote": "",
         }
         sub11 = (
-            f_varint(1, int(quote.get("msg_type", 7643712568255399440))) +
-            f_varint(3, int(quote.get("msg_type", 7643712568255399440))) +
+            f_varint(1, int(quote.get("msg_type", short_id))) +
+            f_varint(3, int(quote.get("msg_type", short_id))) +
             f_varint(4, int(quote.get("msg_id", 0)))
         )
-        field3_val = 7524542718409605381
     else:
         content_str = json.dumps({"aweType": awe_type if awe_type is not None else 0, "text": text}, separators=(',', ':'))
-        field3_val  = 7305620471088775430
 
     body = (
         f_str(1, conv_id) +
-        f_varint(2, short_id) +
-        f_varint(3, field3_val) +
+        f_varint(2, conv_type) +
+        f_varint(3, short_id) +
         f_str(4, content_str) +
         f_bytes(5, f_str(1, "s:mentioned_users")   + f_str(2, "")) +
         f_bytes(5, f_str(1, "s:client_message_id") + f_str(2, client_id)) +
@@ -318,17 +326,27 @@ def build_ws_packet(
     quote: dict | None  = None,
     is_group: bool      = False,
     awe_type: int | None = None,
-) -> tuple[bytes, int]:
-    client_id = str(uuid.uuid4())
+    conv_type: int | None = None,
+    client_id: str | None = None,
+) -> tuple[bytes, int, str]:
+    if client_id is None:
+        client_id = str(uuid.uuid4())
     seq_id    = int(time.time() * 1000)
 
-    if is_group:
-        msg_type = int(conv_id)
-    elif quote:
-        msg_type = 7524542718409605381
-    else:
-        msg_type = 7305620471088775430
-    msg_body     = _build_msg_body(conv_id, short_id, text, client_id, quote, is_group, awe_type)
+    if conv_type is None:
+        conv_type = 2 if is_group else 1
+
+    msg_type = int(short_id)
+    msg_body = _build_msg_body(
+        conv_id=conv_id,
+        short_id=short_id,
+        text=text,
+        client_id=client_id,
+        quote=quote,
+        is_group=is_group,
+        awe_type=awe_type,
+        conv_type=conv_type,
+    )
     request_body = _build_request_body(msg_body, device_id, sdk_ms_token,
                                        tt_public_key, tt_client_data)
 

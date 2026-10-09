@@ -1,0 +1,2 @@
+# Optional Windows dependency for extracting/decrypting local Chromium browser cookies (browsercookies.py)
+pycryptodome>=3.20.0

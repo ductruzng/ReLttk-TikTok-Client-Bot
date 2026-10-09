@@ -7,14 +7,20 @@ import ssl
 import sys
 import time
 from datetime import datetime
+from typing import Optional, Tuple
 
 
 import websockets
 _WS_HEADERS_KW = "additional_headers" if tuple(int(x) for x in websockets.__version__.split(".")[:2]) >= (14, 0) else "extra_headers"
 
-from . import config
-from . import log as _log
-from .core import build_ws_packet, build_reaction_packet, build_delete_packet, build_delete_everyone_packet, build_video_share_packet, get_user_profiles, get_own_user_id, get_item_detail, get_music_detail, get_group_names, get_conversation_history, get_conversations_api, get_pending_strangers, accept_stranger, block_user
+try:
+    from . import config
+    from . import log as _log
+    from .core import build_ws_packet, build_reaction_packet, build_delete_packet, build_delete_everyone_packet, build_video_share_packet, get_user_profiles, get_own_user_id, get_item_detail, get_music_detail, get_group_names, get_conversation_history, get_conversations_api, get_pending_strangers, accept_stranger, block_user
+except ImportError:
+    import config
+    import log as _log
+    from core import build_ws_packet, build_reaction_packet, build_delete_packet, build_delete_everyone_packet, build_video_share_packet, get_user_profiles, get_own_user_id, get_item_detail, get_music_detail, get_group_names, get_conversation_history, get_conversations_api, get_pending_strangers, accept_stranger, block_user
 
 _USER_CACHE_TTL = 60           
 
@@ -23,11 +29,23 @@ class _BotStop(Exception): pass
 
 
 class LttkClient:
-    def __init__(self, username: str | None = None, managed: bool = False):
+    def __init__(
+        self,
+        username: str | None = None,
+        managed: bool = False,
+        enable_msg_db: bool = False,
+        enable_plugins: bool = False,
+        enable_strangers: bool = False,
+    ):
         self._cookies: dict = {}
         self._managed = managed
+        self._enable_plugins = enable_plugins
+        self._enable_strangers = enable_strangers
         if username:
-            from .qrlogin import load_session
+            try:
+                from .qrlogin import load_session
+            except ImportError:
+                from qrlogin import load_session
             self._cookies = load_session(username)
             self._active_session = username
         else:
@@ -56,7 +74,9 @@ class LttkClient:
         self._group_names_loaded = False
         self._accepted_strangers: set[str] = set()
         self._sent_echo: dict[str, dict] = {}
-        self._init_msg_db()
+        self._msg_db = None
+        if enable_msg_db:
+            self._init_msg_db()
 
 
 
@@ -65,7 +85,11 @@ class LttkClient:
         return os.path.join(os.path.dirname(__file__), "plugins")
 
     def _load_plugins(self):
+        if not self._enable_plugins:
+            return
         pdir = self._plugins_dir()
+        if not os.path.exists(pdir):
+            return
         current = set()
         for fname in os.listdir(pdir):
             if not fname.endswith(".py") or fname.startswith("_"):
@@ -80,11 +104,16 @@ class LttkClient:
                     spec = importlib.util.spec_from_file_location(f"bot.plugins.{name}", path)
                     mod = importlib.util.module_from_spec(spec)
                     spec.loader.exec_module(mod)
+                    if not getattr(mod, "ENABLED", False):
+                        if name in self._plugins:
+                            del self._plugins[name]
+                            del self._plugin_mtimes[name]
+                        continue
                     self._plugins[name] = mod
                     self._plugin_mtimes[name] = mtime
                     _log.plugin("lttk", action, name)
                 except Exception as e:
-                    _log.error("lttk", f"error cargando plugin {name}: {e}")
+                    _log.error("lttk", f"error cargando plugin {name}: {type(e).__name__}")
         for name in list(self._plugins):
             if name not in current:
                 del self._plugins[name]
@@ -93,7 +122,9 @@ class LttkClient:
 
     def _init_msg_db(self):
         import sqlite3
-        db_path = os.path.join(os.path.dirname(__file__), "messages.db")
+        state_dir = os.path.join(os.path.dirname(__file__), "state")
+        os.makedirs(state_dir, mode=0o700, exist_ok=True)
+        db_path = os.path.join(state_dir, "messages.db")
         self._msg_db = sqlite3.connect(db_path, check_same_thread=False)
         self._msg_db.execute("""
             CREATE TABLE IF NOT EXISTS messages (
@@ -109,6 +140,8 @@ class LttkClient:
         self._msg_db.commit()
 
     def _store_msg(self, msg: dict):
+        if self._msg_db is None:
+            return
         import json as _json
         msg_id = str(msg.get("msg_id", ""))
         if not msg_id:
@@ -137,15 +170,17 @@ class LttkClient:
             self._msg_db.commit()
 
     def get_message(self, msg_id: str) -> dict | None:
+        if self._msg_db is None:
+            return None
         import json as _json
-        if str(msg_id) in self._sent_echo:
-            return self._sent_echo[str(msg_id)]
         row = self._msg_db.execute(
             "SELECT data FROM messages WHERE msg_id = ?", (str(msg_id),)
         ).fetchone()
         return _json.loads(row[0]) if row else None
 
     def get_messages(self, conv_id: str, limit: int = 50) -> list[dict]:
+        if self._msg_db is None:
+            return []
         import json as _json
         rows = self._msg_db.execute(
             "SELECT data FROM messages WHERE conv_id = ? ORDER BY ts DESC LIMIT ?",
@@ -353,8 +388,10 @@ class LttkClient:
         return [c for c in convs if not c["is_group"]]
 
     async def send_message(self, conv_id: str = "", text: str = "",
-                           short_id: int = 1, quote: dict | None = None,
-                           *, msg: dict | None = None, awe_type: int | None = None) -> int:
+                           short_id: int = 0, quote: dict | None = None,
+                           *, msg: dict | None = None, awe_type: int | None = None,
+                           conv_type: int | None = None,
+                           client_id: str | None = None) -> tuple[int, str]:
         is_group = False
         if msg is not None:
             if not conv_id:
@@ -369,7 +406,7 @@ class LttkClient:
                     "msg_id":   msg["msg_id"],
                     "msg_type": msg["msg_type"],
                 }
-        packet, msg_type, client_id = build_ws_packet(
+        packet, msg_type, actual_client_id = build_ws_packet(
             conv_id        = conv_id,
             short_id       = short_id,
             text           = text,
@@ -380,11 +417,12 @@ class LttkClient:
             quote          = quote,
             is_group       = is_group,
             awe_type       = awe_type,
+            conv_type      = conv_type,
+            client_id      = client_id,
         )
         await self.websocket.send(packet)
         _log.info("send", f"[{conv_id}] {text!r}" if text else f"[{conv_id}] <non-text msg_type={msg_type}>")
-        self._sent_echo[client_id] = {"conv_id": conv_id, "msg_type": msg_type, "msg_id": 0, "client_id": client_id}
-        return msg_type, client_id
+        return msg_type, actual_client_id
 
     async def send_video(self, conv_id: str, item_id: str, short_id: int = 1) -> int:
         detail = await asyncio.get_event_loop().run_in_executor(None, get_item_detail, item_id)
@@ -558,13 +596,25 @@ class LttkClient:
 
 
     @staticmethod
-    def _read_varint(data: bytes, i: int):
-        v = 0; sh = 0
+    def _read_varint(data: bytes, i: int) -> tuple[int, int]:
+        if i < 0:
+            raise ValueError("Invalid offset")
+        v = 0
+        sh = 0
+        count = 0
         while i < len(data):
-            b = data[i]; i += 1
-            v |= (b & 0x7f) << sh; sh += 7
-            if not (b & 0x80): break
-        return v, i
+            b = data[i]
+            i += 1
+            count += 1
+            v |= (b & 0x7F) << sh
+            sh += 7
+            if not (b & 0x80):
+                if v > 0xFFFFFFFFFFFFFFFF:
+                    raise ValueError("Varint overflow (> 64 bits)")
+                return v, i
+            if count >= 10:
+                raise ValueError("Varint exceeds 10 bytes")
+        raise ValueError("Truncated varint")
 
     @staticmethod
     def _proto_to_dict(data: bytes, depth: int = 0) -> dict:
@@ -628,103 +678,199 @@ class LttkClient:
         return result
 
     @staticmethod
+    def _parse_key_value(data: bytes) -> tuple[str, str]:
+        if not data or not isinstance(data, (bytes, bytearray)):
+            return "", ""
+        k: Optional[str] = None
+        v: Optional[str] = None
+        j = 0
+        while j < len(data):
+            tag, j = LttkClient._read_varint(data, j)
+            f = tag >> 3
+            wt = tag & 0x7
+            if f == 0:
+                raise ValueError("Map entry field number cannot be zero")
+            if wt not in (0, 1, 2, 5):
+                raise ValueError(f"Unsupported wire type {wt} in map entry")
+
+            if wt == 0:
+                _, j = LttkClient._read_varint(data, j)
+                if f in (1, 2):
+                    raise ValueError(f"Map entry field {f} must be length-delimited string")
+            elif wt == 1:
+                if j + 8 > len(data):
+                    raise ValueError("Truncated 64-bit field in map entry")
+                j += 8
+                if f in (1, 2):
+                    raise ValueError(f"Map entry field {f} must be length-delimited string")
+            elif wt == 5:
+                if j + 4 > len(data):
+                    raise ValueError("Truncated 32-bit field in map entry")
+                j += 4
+                if f in (1, 2):
+                    raise ValueError(f"Map entry field {f} must be length-delimited string")
+            elif wt == 2:
+                ln, j = LttkClient._read_varint(data, j)
+                if ln < 0 or j + ln > len(data):
+                    raise ValueError("Truncated length-delimited field in map entry")
+                sub = data[j:j + ln]
+                j += ln
+                if f == 1:
+                    try:
+                        k_str = sub.decode("utf-8")
+                    except UnicodeDecodeError as exc:
+                        raise ValueError(f"Invalid UTF-8 in map key: {exc}") from exc
+                    if k is not None and k != k_str:
+                        raise ValueError("Conflicting duplicate map key")
+                    k = k_str
+                elif f == 2:
+                    try:
+                        v_str = sub.decode("utf-8")
+                    except UnicodeDecodeError as exc:
+                        raise ValueError(f"Invalid UTF-8 in map value: {exc}") from exc
+                    if v is not None and v != v_str:
+                        raise ValueError("Conflicting duplicate map value")
+                    v = v_str
+
+        if j != len(data):
+            raise ValueError("Trailing bytes in map entry")
+
+        return k if k is not None else "", v if v is not None else ""
+
+    @staticmethod
     def _parse_msgbody(data: bytes) -> dict:
         import json as _json
+        if not data or not isinstance(data, (bytes, bytearray)):
+            return {}
         result = {}
+        seen_singular = {}
         i = 0
-        while i < len(data):
-            if i >= len(data) or data[i] == 0: i += 1; continue
-            try:
+        try:
+            while i < len(data):
                 tag, i = LttkClient._read_varint(data, i)
-            except Exception: break
-            field = tag >> 3; wtype = tag & 0x7
-            if wtype == 0:
-                v, i = LttkClient._read_varint(data, i)
-                if field == 3:   result["msg_type"] = v
-                elif field == 4: result["msg_id"] = v
-                elif field == 5: result.setdefault("msg_type", v)
-                elif field == 6: result["awe_type"] = v
-                elif field == 7: result["sender_id"] = str(v)
-            elif wtype == 2:
-                ln, i = LttkClient._read_varint(data, i)
-                if i + ln > len(data): break
-                val = data[i:i+ln]; i += ln
-                if field == 1:
-                    try: result["conv_id"] = val.decode("utf-8", errors="replace")
-                    except: pass
-                elif field == 8:
-                    try:
-                        obj = _json.loads(val.decode("utf-8"))
-                        result["text"] = obj.get("text", "")
-                        awe = obj.get("aweType", result.get("awe_type", 0))
-                        result["awe_type"] = awe
-                        if awe in (800, 810):
-                            result["video_id"]      = str(obj.get("itemId", ""))
-                            result["video_creator"] = str(obj.get("uid", ""))
-                        elif awe == 22:
-                            result["music_id"]    = str(obj.get("music_id", ""))
-                            result["music_title"] = obj.get("title", "")
-                        elif awe == 1021:
-                            result["live_room_id"]    = str(obj.get("room_id", ""))
-                            result["live_owner_id"]   = str(obj.get("room_owner_id", ""))
-                            result["live_owner_name"] = obj.get("room_owner_name", "")
-                        elif awe == 40:
-                            result["comment_text"]        = obj.get("comment", "")
-                            result["comment_video_id"]    = str(obj.get("aweme_id", ""))
-                            result["comment_author_name"] = obj.get("author_name", "")
-                            imgs = obj.get("comment_image_list", [])
-                            if imgs:
-                                urls = imgs[0].get("url_list", [])
-                                result["comment_sticker_url"] = urls[0] if urls else ""
-                            else:
-                                result["comment_sticker_url"] = ""
-                        elif awe == 50001:
-                            result["group_command"]  = obj.get("command_type", 0)
-                            result["group_conv_id"]  = str(obj.get("conversation_id", ""))
-                            result["group_added"]    = [str(x) for x in obj.get("added_participant", [])]
-                            result["group_removed"]  = [str(x) for x in obj.get("removed_participant", [])]
-                        elif awe == 25:
-                            result["profile_uid"]      = str(obj.get("uid", ""))
-                            result["profile_sec_uid"]  = obj.get("secUID", "")
-                            result["profile_name"]     = obj.get("name", "")
-                    except: pass
-                elif field == 18:
-                    import json as _json
-                    try:
-                        j = 0
-                        while j < len(val):
-                            t2, j = LttkClient._read_varint(val, j)
-                            f2 = t2 >> 3; w2 = t2 & 7
-                            if w2 == 0:
-                                v2, j = LttkClient._read_varint(val, j)
-                                if f2 == 1: result["quoted_msg_id"] = v2
-                            elif w2 == 2:
-                                ln2, j = LttkClient._read_varint(val, j)
-                                v2 = val[j:j+ln2]; j += ln2
-                                if f2 == 2:
-                                    try:
-                                        ref = _json.loads(v2.decode("utf-8"))
-                                        result["quoted_uid"]     = ref.get("refmsg_uid", "")
-                                        result["quoted_sec_uid"] = ref.get("refmsg_sec_uid", "")
-                                        result["quoted_awe_type"] = ref.get("refmsg_type", 0)
-                                        inner = ref.get("refmsg_content", "")
-                                        try:
-                                            inner_obj = _json.loads(inner)
-                                            result["quoted_text"]     = inner_obj.get("text", "")
-                                            if inner_obj.get("aweType"):
-                                                result["quoted_awe_type"] = inner_obj.get("aweType", 0)
-                                            result["quoted_video_id"] = str(inner_obj.get("itemId", ""))
-                                            result["quoted_video_uid"]= str(inner_obj.get("uid", ""))
-                                            result["quoted_sticker_id"] = str(inner_obj.get("stickerId", ""))
-                                        except: pass
-                                    except: pass
-                            else: break
-                    except: pass
-                elif field == 14:
-                    try: result["sec_uid"] = val.decode("utf-8", errors="replace")
-                    except: pass
-            else:
-                break
+                field = tag >> 3
+                wtype = tag & 0x7
+                if field == 0:
+                    return {}
+                if wtype not in (0, 1, 2, 5):
+                    return {}
+
+                if wtype == 0:
+                    v, i = LttkClient._read_varint(data, i)
+                    if field in (1, 8, 9, 14):
+                        return {}
+                    if field in (2, 3, 4, 5, 6):
+                        if field in seen_singular and seen_singular[field] != v:
+                            return {}
+                        seen_singular[field] = v
+                    elif field == 7:
+                        s_str = str(v)
+                        if 7 in seen_singular and seen_singular[7] != s_str:
+                            return {}
+                        seen_singular[7] = s_str
+                        result["sender_id"] = s_str
+                        result["sender"] = s_str
+
+                    if field == 2:
+                        result["conv_type"] = v
+                    elif field == 3:
+                        result["server_message_id"] = v
+                        result["msg_id"] = v
+                    elif field == 4:
+                        result["index_in_conversation"] = v
+                    elif field == 5:
+                        result["conv_short_id"] = v
+                    elif field == 6:
+                        result["message_type"] = v
+                        result["msg_type"] = v
+
+                elif wtype == 2:
+                    ln, i = LttkClient._read_varint(data, i)
+                    if ln < 0 or i + ln > len(data):
+                        return {}
+                    val = data[i:i + ln]
+                    i += ln
+
+                    if field in (2, 3, 4, 5, 6):
+                        return {}
+                    if field in (1, 8, 14):
+                        if field in seen_singular and seen_singular[field] != val:
+                            return {}
+                        seen_singular[field] = val
+                    elif field == 7:
+                        try:
+                            s_str = val.decode("utf-8")
+                        except Exception:
+                            return {}
+                        if 7 in seen_singular and seen_singular[7] != s_str:
+                            return {}
+                        seen_singular[7] = s_str
+                        result["sender_id"] = s_str
+                        result["sender"] = s_str
+
+                    if field == 1:
+                        try:
+                            result["conv_id"] = val.decode("utf-8")
+                        except Exception:
+                            return {}
+                    elif field == 8:
+                        try:
+                            obj = _json.loads(val.decode("utf-8"))
+                            if not isinstance(obj, dict):
+                                return {}
+                            result["text"] = obj.get("text", "")
+                            awe = obj.get("aweType", result.get("awe_type", 0))
+                            result["awe_type"] = awe
+                            if awe in (800, 810):
+                                result["video_id"] = str(obj.get("itemId", ""))
+                                result["video_creator"] = str(obj.get("uid", ""))
+                            elif awe == 22:
+                                result["music_id"] = str(obj.get("music_id", ""))
+                                result["music_title"] = obj.get("title", "")
+                            elif awe == 1021:
+                                result["live_room_id"] = str(obj.get("room_id", ""))
+                                result["live_owner_id"] = str(obj.get("room_owner_id", ""))
+                                result["live_owner_name"] = obj.get("room_owner_name", "")
+                        except Exception:
+                            return {}
+                    elif field == 9:
+                        k, v_str = LttkClient._parse_key_value(val)
+                        if k:
+                            if "ext" not in result:
+                                result["ext"] = {}
+                            if k == "s:client_message_id":
+                                if "client_message_id" in result and result["client_message_id"] != v_str:
+                                    return {}
+                                result["client_message_id"] = v_str
+                            if k in result["ext"] and result["ext"][k] != v_str:
+                                if k == "s:client_message_id":
+                                    return {}
+                            result["ext"][k] = v_str
+                    elif field == 14:
+                        try:
+                            result["sec_uid"] = val.decode("utf-8")
+                        except Exception:
+                            return {}
+
+                elif wtype == 1:
+                    if i + 8 > len(data):
+                        return {}
+                    i += 8
+                    if field in (1, 2, 3, 4, 5, 6, 7, 8, 9, 14):
+                        return {}
+
+                elif wtype == 5:
+                    if i + 4 > len(data):
+                        return {}
+                    i += 4
+                    if field in (1, 2, 3, 4, 5, 6, 7, 8, 9, 14):
+                        return {}
+
+            if i != len(data):
+                return {}
+        except Exception:
+            return {}
+
         return result
 
     @staticmethod
@@ -813,6 +959,119 @@ class LttkClient:
             "op":          modifys[0].get("Op", 0),
         }
 
+    @staticmethod
+    def find_all_msgbodies(raw: bytes, depth: int = 0) -> list[dict]:
+        if depth > 8 or not raw or not isinstance(raw, (bytes, bytearray)):
+            return []
+
+        # Pass 1: Validate container wire format completely. Fail closed on malformed container.
+        delimited_fields = []
+        i = 0
+        try:
+            while i < len(raw):
+                tag, i = LttkClient._read_varint(raw, i)
+                field = tag >> 3
+                wtype = tag & 0x7
+                if field == 0:
+                    return []
+                if wtype not in (0, 1, 2, 5):
+                    return []
+
+                if wtype == 0:
+                    _, i = LttkClient._read_varint(raw, i)
+                elif wtype == 1:
+                    if i + 8 > len(raw):
+                        return []
+                    i += 8
+                elif wtype == 5:
+                    if i + 4 > len(raw):
+                        return []
+                    i += 4
+                elif wtype == 2:
+                    ln, i = LttkClient._read_varint(raw, i)
+                    if ln < 0 or i + ln > len(raw):
+                        return []
+                    delimited_fields.append(raw[i:i + ln])
+                    i += ln
+
+            if i != len(raw):
+                return []
+        except Exception:
+            return []
+
+        # Pass 2: Extract candidate MessageBodies from length-delimited fields.
+        candidates = []
+        for val in delimited_fields:
+            if len(val) > 10:
+                cand = LttkClient._parse_msgbody(val)
+                if cand.get("conv_id") and (
+                    cand.get("server_message_id")
+                    or cand.get("text")
+                    or cand.get("client_message_id")
+                ):
+                    candidates.append(cand)
+                # Recurse: invalid nested leaf returns [] and does not discard siblings
+                candidates.extend(LttkClient.find_all_msgbodies(val, depth + 1))
+
+        return candidates
+
+    @staticmethod
+    def check_echo_correlation(
+        candidate: dict,
+        expected_client_msg_id: str,
+        expected_conv_id: str,
+        own_user_id: str,
+        expected_text: str,
+    ) -> tuple[bool, Optional[str], Optional[int]]:
+        """Conservative correlated server message echo confirmation:
+        1. UUID in THAT message's ext matches outgoing client_message_id
+        2. conv matches expected_conv_id
+        3. actual sender matches own UID
+        4. positive server_message_id
+        5. content matches expected_text
+        Returns (is_match, reason, server_message_id)
+        """
+        if not candidate or not isinstance(candidate, dict):
+            return False, "invalid_candidate", None
+
+        # Reject bool / float IDs
+        if isinstance(own_user_id, (bool, float)) or not str(own_user_id).strip():
+            return False, "invalid_own_user_id", None
+        if isinstance(expected_client_msg_id, (bool, float)) or not str(expected_client_msg_id).strip():
+            return False, "invalid_expected_client_msg_id", None
+        if isinstance(expected_conv_id, (bool, float)) or not str(expected_conv_id).strip():
+            return False, "invalid_expected_conv_id", None
+
+        client_id = candidate.get("client_message_id") or candidate.get("ext", {}).get("s:client_message_id", "")
+        if isinstance(client_id, (bool, float)) or str(client_id) != str(expected_client_msg_id):
+            return False, "client_id_mismatch", None
+
+        cand_conv = candidate.get("conv_id")
+        if isinstance(cand_conv, (bool, float)) or str(cand_conv) != str(expected_conv_id):
+            return False, "conv_id_mismatch", None
+
+        actual_sender = candidate.get("sender_id") if candidate.get("sender_id") is not None else candidate.get("sender", "")
+        if isinstance(actual_sender, (bool, float)) or str(actual_sender) != str(own_user_id):
+            return False, "sender_not_own_uid", None
+
+        server_msg_id = candidate.get("server_message_id")
+        if server_msg_id is None:
+            server_msg_id = candidate.get("msg_id")
+        if server_msg_id is None or isinstance(server_msg_id, (bool, float)):
+            return False, "invalid_server_msg_id", None
+
+        try:
+            sid_int = int(server_msg_id)
+            if sid_int <= 0:
+                return False, "non_positive_server_msg_id", None
+        except (ValueError, TypeError):
+            return False, "invalid_server_msg_id", None
+
+        if candidate.get("text") != expected_text:
+            return False, "content_text_mismatch", None
+
+        return True, "matched", sid_int
+
     def _parse(self, data: bytes, decompressed: bytes | None = None, _allow_own: bool = False) -> dict | None:
         def find_msgbody(raw, depth=0):
             if depth > 8:
@@ -853,7 +1112,7 @@ class LttkClient:
         if conv_match:
             id_a, id_b = conv_match.group(1), conv_match.group(2)
             own = self._own_user_id
-            msg["sender_id"] = id_b if id_a == own else id_a
+            msg["partner_id"] = id_b if id_a == own else id_a
 
         if f7_sender == self._own_user_id and not _allow_own:
             return None
@@ -990,7 +1249,7 @@ class LttkClient:
         }
 
     async def _stranger_loop(self):
-        while True:
+        while self._enable_strangers:
             try:
                 cookies, own_uid = self._cookies, self._own_user_id
                 pending = await asyncio.get_event_loop().run_in_executor(None, lambda: get_pending_strangers(cookies=cookies, own_user_id=own_uid))
@@ -1021,7 +1280,7 @@ class LttkClient:
         self._store_msg(msg)
         conv_id = msg.get("conv_id", "")
         sender = msg.get("sender_id", "")
-        if conv_id and sender and sender != self._own_user_id and conv_id not in self._accepted_strangers:
+        if self._enable_strangers and conv_id and sender and sender != self._own_user_id and conv_id not in self._accepted_strangers:
             try:
                 cookies = self._cookies
                 await asyncio.get_event_loop().run_in_executor(None, lambda: accept_stranger(conv_id, sender, cookies=cookies))
@@ -1261,8 +1520,8 @@ class LttkClient:
                 self._load_session()
 
         ssl_ctx = ssl.create_default_context()
-        ssl_ctx.check_hostname = False
-        ssl_ctx.verify_mode = ssl.CERT_NONE
+        ssl_ctx.check_hostname = True
+        ssl_ctx.verify_mode = ssl.CERT_REQUIRED
 
         try:
             for attempt in range(4):
@@ -1325,7 +1584,7 @@ class LttkClient:
                         asyncio.create_task(self._heartbeat()),
                         asyncio.create_task(self._receiver()),
                         asyncio.create_task(self._watch_plugins()),
-                        asyncio.create_task(self._stranger_loop()),
+                        *([asyncio.create_task(self._stranger_loop())] if self._enable_strangers else []),
                         *([asyncio.create_task(self._console())] if not self._managed else []),
                         *startup_tasks,
                     ]

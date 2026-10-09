@@ -1,185 +1,394 @@
-import asyncio
-import sys
+"""CLI entrypoint for ReLttk Daily Streak.
+
+Default behavior is a one-shot offline DRY-RUN using only Python standard library.
+Network transmission requires explicit --send opt-in.
+"""
+
+import argparse
+import json
 import os
+import re
+import sys
+from datetime import datetime
+from typing import Tuple, Optional
 
-_HERE   = os.path.dirname(os.path.abspath(__file__))
-_PARENT = os.path.dirname(_HERE)
-_PKG    = os.path.basename(_HERE)
+# Lazy imports for optional modules
+_PKG_DIR = os.path.dirname(os.path.abspath(__file__))
+if _PKG_DIR not in sys.path:
+    sys.path.insert(0, _PKG_DIR)
 
-if _PARENT not in sys.path:
-    sys.path.insert(0, _PARENT)
-
-_pkg = __import__(_PKG)
-
-
-def _list_sessions():
-    from importlib import import_module
-    return import_module(f"{_PKG}.qrlogin").list_sessions()
+DEFAULT_CONFIG_FILE = "streak.json"
 
 
-async def _run_all():
-    from importlib import import_module
-    log     = import_module(f"{_PKG}.log")
-    qrlogin = import_module(f"{_PKG}.qrlogin")
-    LttkClient = _pkg.LttkClient
+def get_ho_chi_minh_date() -> str:
+    """Return current date formatted for Asia/Ho_Chi_Minh timezone using stdlib."""
+    try:
+        import zoneinfo
+        tz = zoneinfo.ZoneInfo("Asia/Ho_Chi_Minh")
+    except Exception:
+        from datetime import timezone, timedelta
+        tz = timezone(timedelta(hours=7))
+    return datetime.now(tz).strftime("%Y-%m-%d")
 
-    bots: dict[str, asyncio.Task]      = {}
-    bot_instances: dict[str, LttkClient] = {}
-    _stopped: set[str]                 = set()  
-    loop = asyncio.get_event_loop()
 
-    def _start(username: str):
-        if username in bots and not bots[username].done():
-            return
-        log.info("lttk", f"arrancando sesion: {username}")
-        bot = LttkClient(username=username, managed=True)
-        bot_instances[username] = bot
-        bots[username] = asyncio.create_task(bot.run())
+def validate_config(cfg: object) -> Tuple[bool, list[str], list[dict]]:
+    """Validate streak configuration using stdlib only.
 
-    async def _do_qr():
-        log.info("lttk", "iniciando login por QR...")
-        try:
-            await loop.run_in_executor(None, qrlogin.run)
-        except (KeyboardInterrupt, asyncio.CancelledError):
-            qrlogin._stop_event.set()
-            raise
-        except Exception as e:
-            log.error("lttk", f"error en QR login: {e}")
-            return
-        for s in _list_sessions():
-            _start(s)
+    Returns (is_valid, error_messages, parsed_targets).
+    """
+    errors = []
+    parsed_targets = []
 
-    sessions = _list_sessions()
-    if not sessions:
-        await _do_qr()
+    if not isinstance(cfg, dict):
+        return False, ["Configuration file must contain a JSON object."], []
+
+    session = cfg.get("session")
+    if session is None or not isinstance(session, str):
+        errors.append("Field 'session' must be a string.")
+    elif not session.strip():
+        errors.append("Field 'session' is empty. Specify the session name configured via 'python main.py login'.")
     else:
-        for s in sessions:
-            _start(s)
+        session_str = session.strip()
+        if "/" in session_str or "\\" in session_str or ".." in session_str or "\0" in session_str or not re.match(r'^[a-zA-Z0-9_\.-]+$', session_str):
+            errors.append(f"Field 'session' has unsafe name {session_str!r}. Path traversal characters are disallowed.")
 
-    async def _close_session(username: str):
-        """Logout, delete credentials, cancel task — marks as intentional."""
-        _stopped.add(username)
-        bot = bot_instances.get(username)
-        if bot:
-            try:
-                await bot.close_session()
-            except Exception as e:
-                log.warn("lttk", f"error cerrando sesion {username}: {e}")
-        task = bots.get(username)
-        if task and not task.done():
-            task.cancel()
-        log.ok("lttk", f"sesion {username} cerrada")
+    message = cfg.get("message")
+    if not message or not isinstance(message, str) or not message.strip():
+        errors.append("Field 'message' must be a non-empty string.")
 
-    async def _console():
-        while True:
-            line = await loop.run_in_executor(None, sys.stdin.readline)
-            cmd = line.strip()
-            cmd_lower = cmd.lower()
+    raw_targets = cfg.get("targets")
+    if raw_targets is None or not isinstance(raw_targets, list):
+        errors.append("Field 'targets' must be a list of target objects.")
+    elif len(raw_targets) == 0:
+        errors.append("Field 'targets' is empty. At least one conversation target is required.")
+    else:
+        seen_ids = set()
+        for i, t in enumerate(raw_targets):
+            prefix = f"targets[{i}]"
+            if not isinstance(t, dict):
+                errors.append(f"{prefix} must be a JSON object with conv_id, conv_short_id, conv_type.")
+                continue
 
-            if cmd_lower == "add":
-                await _do_qr()
+            conv_id = t.get("conv_id")
+            if not conv_id or not isinstance(conv_id, str) or not conv_id.strip():
+                errors.append(f"{prefix}.conv_id must be a non-empty conversation identifier string.")
+            else:
+                conv_id = conv_id.strip()
+                if conv_id in seen_ids:
+                    errors.append(f"Duplicate conversation ID detected: '{conv_id}'. Each target must be unique.")
+                seen_ids.add(conv_id)
 
-            elif cmd_lower == "list":
-                if bots:
-                    for name, task in bots.items():
-                        status = "activo" if not task.done() else "detenido"
-                        log.info("lttk", f"  {name}: {status}")
-                else:
-                    log.info("lttk", "no hay sesiones activas")
+            raw_short_id = t.get("conv_short_id")
+            if isinstance(raw_short_id, bool) or isinstance(raw_short_id, float):
+                errors.append(
+                    f"{prefix}.conv_short_id must be a positive integer (> 0). Got {raw_short_id!r}."
+                )
+                short_id = 0
+            else:
+                try:
+                    short_id = int(raw_short_id)
+                    if short_id <= 0:
+                        errors.append(
+                            f"{prefix}.conv_short_id must be a positive integer (> 0). Got {raw_short_id!r}."
+                        )
+                        short_id = 0
+                    elif short_id > 0xFFFFFFFFFFFFFFFF:
+                        errors.append(
+                            f"{prefix}.conv_short_id overflows 64-bit integer range. Got {raw_short_id!r}."
+                        )
+                        short_id = 0
+                except (ValueError, TypeError):
+                    errors.append(
+                        f"{prefix}.conv_short_id must be a positive integer (> 0). "
+                        f"Got {raw_short_id!r}. Use 'python main.py list-conversations' to obtain short IDs."
+                    )
+                    short_id = 0
 
-            elif cmd_lower == "stop":
-                for task in bots.values():
-                    task.cancel()
-                break
+            raw_type = t.get("conv_type", 1)
+            if isinstance(raw_type, bool) or isinstance(raw_type, float):
+                errors.append(f"{prefix}.conv_type must be 1 (Direct) or 2 (Group). Got {raw_type!r}.")
+                conv_type = 1
+            else:
+                try:
+                    conv_type = int(raw_type)
+                    if conv_type not in (1, 2):
+                        raise ValueError()
+                except (ValueError, TypeError):
+                    errors.append(f"{prefix}.conv_type must be 1 (Direct) or 2 (Group). Got {raw_type!r}.")
+                    conv_type = 1
 
-            elif cmd_lower.startswith("close"):
-                parts = cmd.split(None, 1)
-                if len(parts) == 2:
-                    target = parts[1]
-                    if target in bots:
-                        await _close_session(target)
-                    else:
-                        log.warn("lttk", f"sesion no encontrada: {target}")
-                else:
-                    active = [n for n, t in bots.items() if not t.done()]
-                    if not active:
-                        log.info("lttk", "no hay sesiones activas para cerrar")
-                    elif len(active) == 1:
-                        await _close_session(active[0])
-                    else:
-                        log.info("lttk", "elige una sesion para cerrar:")
-                        for i, name in enumerate(active, 1):
-                            log.info("lttk", f"  {i}. {name}")
-                        choice = await loop.run_in_executor(None, sys.stdin.readline)
-                        choice = choice.strip()
-                        if choice.isdigit():
-                            idx = int(choice) - 1
-                            if 0 <= idx < len(active):
-                                await _close_session(active[idx])
-                            else:
-                                log.warn("lttk", "numero invalido")
-                        elif choice in bots:
-                            await _close_session(choice)
-                        else:
-                            log.warn("lttk", "cancelado")
+            parsed_targets.append({
+                "conv_id": conv_id or f"target_{i}",
+                "conv_short_id": short_id,
+                "conv_type": conv_type,
+            })
 
-            elif cmd:
-                log.info("lttk", "comandos: add | list | stop | close [usuario]")
+    return len(errors) == 0, errors, parsed_targets
 
-    async def _watchdog():
-        while True:
-            await asyncio.sleep(10)
-            for name, task in list(bots.items()):
-                if task.done() and name not in _stopped:
-                    exc = task.exception() if not task.cancelled() else None
-                    if exc:
-                        log.warn("lttk", f"sesion {name} terminó con error ({exc}), reiniciando...")
-                    _start(name)
 
-    await asyncio.gather(_console(), _watchdog(), *bots.values(), return_exceptions=True)
+def validate_config_data(cfg: object) -> Tuple[bool, str, list[dict]]:
+    """Single strict configuration validator shared across main and oneshot."""
+    valid, errors, targets = validate_config(cfg)
+    return valid, "; ".join(errors), targets
+
+
+def cmd_dry_run(config_path: str = DEFAULT_CONFIG_FILE) -> int:
+    """Execute stdlib-only dry run display."""
+    today = get_ho_chi_minh_date()
+
+    print("=" * 64)
+    print(" ReLttk Daily Streak Bot - Plan (OFFLINE DRY-RUN)")
+    print("=" * 64)
+    print(f" Target Date:      {today} (Asia/Ho_Chi_Minh)")
+    print(f" Config File:      {os.path.abspath(config_path)}")
+
+    if not os.path.exists(config_path):
+        print(f"\n[!] Config file '{config_path}' does not exist.")
+        print("    Create it with the following structure:")
+        print(json.dumps({
+            "session": "my_account",
+            "message": "Daily streak message",
+            "targets": [
+                {"conv_id": "0:1:12345:67890", "conv_short_id": 1234567890, "conv_type": 1}
+            ]
+        }, indent=2))
+        return 1
+
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+    except Exception:
+        print(f"\n[!] Error parsing JSON in '{config_path}'.")
+        return 1
+
+    if not isinstance(cfg, dict):
+        print(f"\n[!] Configuration file '{config_path}' must contain a JSON object.")
+        return 1
+
+    is_valid, errors, targets = validate_config(cfg)
+
+    session_name = cfg.get("session") or "<none>"
+    message_text = cfg.get("message") or "<none>"
+
+    print(f" Session Name:     {session_name}")
+    print(f" Message Text:     {message_text!r}")
+    print("-" * 64)
+
+    if not is_valid:
+        print("[!] Configuration Validation Issues:")
+        for err in errors:
+            print(f"    - {err}")
+        print("\n[NOTE] Dry-run stopped due to configuration errors.")
+        print("       Edit streak.json to correct these fields before sending.")
+        return 1
+
+    print(f" Planned Targets ({len(targets)} total):")
+    for idx, t in enumerate(targets, 1):
+        type_label = "Direct (1)" if t["conv_type"] == 1 else "Group (2)"
+        print(f"   {idx}. Conv ID:       {t['conv_id']}")
+        print(f"      Short ID:      {t['conv_short_id']}")
+        print(f"      Type:          {type_label}")
+        print(f"      Ledger Status: Quota not checked offline (requires authenticated session)")
+
+    print("=" * 64)
+    print(" [DRY-RUN COMPLETE]")
+    print(" - Zero network calls were made.")
+    print(" - No session credentials or cookies were accessed.")
+    print(" - No SQLite database files were created or modified.")
+    print(" - Quota not checked offline (evaluated during live authenticated send).")
+    print(" - To transmit messages for real, use explicit opt-in:")
+    print(f"       python main.py --send --config {config_path}")
+    print("=" * 64)
+    return 0
+
+
+def cmd_send(config_path: str = DEFAULT_CONFIG_FILE) -> int:
+    """Execute one-shot live transmission with explicit opt-in."""
+    print("=" * 64)
+    print(" ReLttk Daily Streak Bot - Executing One-Shot Send")
+    print("=" * 64)
+
+    try:
+        import oneshot
+        import asyncio
+        result = asyncio.run(oneshot.run_oneshot_send(config_path=config_path))
+        print("\nTransmission Summary:")
+        print(f" Canonical UID: {result.get('canonical_uid')}")
+        print(f" Date:          {result.get('date')}")
+        has_failure = False
+        results_list = result.get("results", [])
+        for r in results_list:
+            st = r.get("status")
+            cid = r.get("conv_id")
+            if st == "confirmed":
+                print(f"  [+] {cid}: CONFIRMED (Server Msg ID: {r.get('server_msg_id')})")
+            elif st == "skipped":
+                print(f"  [-] {cid}: SKIPPED ({r.get('reason')})")
+            else:
+                has_failure = True
+                print(f"  [x] {cid}: FAILED_UNKNOWN ({r.get('reason')})")
+        if has_failure or not results_list:
+            return 1
+        return 0
+    except Exception as e:
+        print(f"\n[!] Send execution failed: {type(e).__name__}")
+        return 1
+
+
+def cmd_login() -> int:
+    """Interactive QR code login for future user use."""
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        print("[!] Interactive QR login requires both stdin and stdout to be interactive TTY terminals.")
+        return 1
+
+    print("Starting interactive QR login...")
+    try:
+        import qrlogin
+        qrlogin.run()
+        return 0
+    except Exception as e:
+        print(f"[!] Login error: {type(e).__name__}")
+        return 1
+
+
+def cmd_list_conversations(session_name: str) -> int:
+    """Fetch and display server conversation metadata for config preparation."""
+    if not session_name or not session_name.strip():
+        print("[!] --session is required for list-conversations.")
+        return 1
+    session_name = session_name.strip()
+    if "/" in session_name or "\\" in session_name or ".." in session_name or "\0" in session_name:
+        print("[!] Invalid session name: path traversal characters are disallowed.")
+        return 1
+
+    try:
+        import qrlogin
+        import core.api as api
+        import config
+
+        cookies = qrlogin.load_session(session_name)
+        if not cookies.get("sessionid"):
+            print(f"[!] Session '{session_name}' contains no valid sessionid.")
+            return 1
+
+        print("Fetching conversations from TikTok server inbox...")
+        convs = api.get_conversations(cookies=cookies, device_id=config.DEVICE_ID)
+        if not convs:
+            print("No conversations found in server inbox.")
+            return 0
+
+        print(f"\nFound {len(convs)} conversations:")
+        print(f"{'#':<3} {'Conv ID':<36} {'Short ID':<22} {'Type':<8} {'Name'}")
+        print("-" * 85)
+        for i, c in enumerate(convs, 1):
+            type_str = "Group" if c.get("is_group") else "Direct"
+            print(
+                f"{i:<3} {c.get('conv_id', ''):<36} "
+                f"{str(c.get('conv_short_id', 0)):<22} "
+                f"{type_str:<8} "
+                f"{c.get('name', '')}"
+            )
+        print("\nUse the Conv ID and Short ID above in your streak.json config targets.")
+        return 0
+    except Exception as e:
+        print(f"[!] Error fetching conversations: {type(e).__name__}")
+        return 1
+
+
+def cmd_status(config_path: str = DEFAULT_CONFIG_FILE) -> int:
+    """Readonly inspection of the SQLite ledger."""
+    today = get_ho_chi_minh_date()
+    print(f"Ledger Status for {today} (Asia/Ho_Chi_Minh):")
+    try:
+        import ledger
+        if not os.path.exists(ledger._DEFAULT_LEDGER_PATH):
+            print("  Ledger database file does not exist yet (clean state).")
+            return 0
+
+        conn = ledger._get_readonly_connection()
+        if conn is None:
+            print("  Ledger database file not accessible.")
+            return 0
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT canonical_uid, conv_id, date, status, attempt_time, server_msg_id, reason_code "
+                "FROM daily_ledger ORDER BY date DESC, attempt_time DESC LIMIT 20"
+            )
+            rows = cur.fetchall()
+            if not rows:
+                print("  No records found in daily ledger.")
+                return 0
+            print(f"{'Date':<12} {'Status':<16} {'Conv ID':<32} {'Server Msg ID':<16} {'Reason'}")
+            print("-" * 90)
+            for r in rows:
+                print(f"{r[2]:<12} {r[3]:<16} {r[1]:<32} {str(r[5] or ''):<16} {str(r[6] or '')}")
+            return 0
+        finally:
+            conn.close()
+    except Exception as e:
+        print(f"[!] Error reading ledger: {type(e).__name__}")
+        return 1
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="ReLttk Daily Streak Bot - Safe One-Shot CLI",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "--config", "-c",
+        default=DEFAULT_CONFIG_FILE,
+        help="Path to JSON configuration file (default: streak.json)",
+    )
+
+    mode_group = parser.add_mutually_exclusive_group()
+    mode_group.add_argument(
+        "--send",
+        action="store_true",
+        help="Explicit opt-in to execute live message transmission (default is offline dry-run)",
+    )
+    mode_group.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Explicit dry-run mode (default)",
+    )
+
+    subparsers = parser.add_subparsers(dest="command", help="Additional commands")
+
+    subparsers.add_parser("login", help="Interactive QR login to save a session")
+
+    list_parser = subparsers.add_parser(
+        "list-conversations",
+        help="List conversations with Conv ID and Short ID from TikTok server",
+    )
+    list_parser.add_argument(
+        "--session", "-s",
+        required=True,
+        help="Session name to use (required)",
+    )
+
+    subparsers.add_parser("status", help="Inspect local SQLite ledger records in readonly mode")
+
+    args = parser.parse_args()
+
+    # Reject mode flags with subcommands before any network activity
+    if args.command is not None and (args.send or args.dry_run):
+        parser.error("Mode flags (--send, --dry-run) cannot be combined with subcommands.")
+
+    if args.command == "login":
+        return cmd_login()
+    elif args.command == "list-conversations":
+        return cmd_list_conversations(session_name=args.session)
+    elif args.command == "status":
+        return cmd_status(config_path=args.config)
+
+    if args.send:
+        return cmd_send(config_path=args.config)
+    else:
+        # Default behavior: offline dry-run
+        return cmd_dry_run(config_path=args.config)
 
 
 if __name__ == "__main__":
-    args = sys.argv[1:]
-
-    if args and args[0] == "cookies":
-        path = args[1] if len(args) > 1 else "cookies.json"
-        from importlib import import_module
-        import json
-        qrlogin = import_module(f"{_PKG}.qrlogin")
-        log = import_module(f"{_PKG}.log")
-        try:
-            with open(path, encoding="utf-8") as f:
-                data = json.load(f)
-            if isinstance(data, list):
-                cookies = {c["name"]: c["value"] for c in data if c.get("value")}
-            else:
-                cookies = data
-            if not cookies.get("sessionid"):
-                raise ValueError("no se encontro sessionid en el archivo")
-        except Exception as e:
-            log.error("cookies", str(e))
-            sys.exit(1)
-        qrlogin._write_cookies(cookies)
-        log.ok("cookies", "importado, reinicia el bot para aplicar")
-
-    elif args and args[0] == "browser":
-        browser = args[1] if len(args) > 1 else "chrome"
-        from importlib import import_module
-        browsercookies = import_module(f"{_PKG}.browsercookies")
-        qrlogin = import_module(f"{_PKG}.qrlogin")
-        log = import_module(f"{_PKG}.log")
-        try:
-            cookies = browsercookies.get_tiktok_cookies(browser)
-        except Exception as e:
-            log.error("browser", str(e))
-            sys.exit(1)
-        qrlogin._write_cookies(cookies)
-        log.ok("browser", f"cookies de {browser} importadas, reinicia el bot para aplicar")
-
-    else:
-        try:
-            asyncio.run(_run_all())
-        except KeyboardInterrupt:
-            from importlib import import_module
-            import_module(f"{_PKG}.qrlogin")._stop_event.set()
+    sys.exit(main())

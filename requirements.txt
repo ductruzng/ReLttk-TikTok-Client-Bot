@@ -1,5 +1,4 @@
-websockets
-lz4
-qrcode
-stealth-requests
-pycryptodome
+websockets>=15.0.1,<16.0.0
+lz4>=4.4.5,<5.0.0
+qrcode>=8.0,<9.0
+tzdata>=2024.1

@@ -14,13 +14,20 @@ _SIGN_OPTS = dict(
 
 
 def _get_signers():
-    from ..signers.xdynosaur import pack as _a
-    from ..signers.xgnarly import pack as _b
+    try:
+        from ..signers.xdynosaur import pack as _a
+        from ..signers.xgnarly import pack as _b
+    except ImportError:
+        from signers.xdynosaur import pack as _a
+        from signers.xgnarly import pack as _b
     return _a, _b
 
 
 def _get_bogus():
-    from ..signers.bogus import Signer
+    try:
+        from ..signers.bogus import Signer
+    except ImportError:
+        from signers.bogus import Signer
     return Signer
 
 
