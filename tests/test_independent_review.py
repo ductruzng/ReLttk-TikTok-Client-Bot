@@ -22,6 +22,157 @@ from core.proto import f_str, f_varint, f_bytes
 
 
 class IndependentReview(unittest.TestCase):
+    def setUp(self):
+        # Never pick up a real browser ttwid/access_key from the developer's ws_auth.local.json
+        p = patch.object(oneshot, "load_ws_auth", return_value={})
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_websocket_rejection_reports_only_http_status(self):
+        from websockets.datastructures import Headers
+        from websockets.exceptions import InvalidStatus
+        from websockets.http11 import Response
+
+        for status in (401, 403, 429):
+            response = Response(status, "fake-sensitive-reason", Headers({
+                "Set-Cookie": "sessionid=fake-sensitive-cookie"
+            }), body=b"fake-sensitive-body")
+            output = io.StringIO()
+            with self.subTest(status=status), \
+                    patch.object(oneshot, "run_oneshot_send", side_effect=InvalidStatus(response)), \
+                    contextlib.redirect_stdout(output):
+                self.assertEqual(main.cmd_send("unused-test-plan.json"), 1)
+            self.assertIn(f"HTTP {status}", output.getvalue())
+            self.assertIn("No message was transmitted", output.getvalue())
+            self.assertNotIn("fake-sensitive", output.getvalue())
+
+    def test_ws_url_matches_browser_handshake_shape(self):
+        from client import build_ws_url
+        url = build_ws_url({"ttwid": "1%7Cfake%7C123%7Cabc", "msToken": "fake_tok", "sessionid": "fake-sid"},
+                           access_key="0" * 32)
+        self.assertEqual(
+            url,
+            "wss://im-ws-sg.tiktok.com/ws/v2?device_platform=web&version_code=fws_1.0.0"
+            f"&access_key={'0' * 32}&fpid=9&aid=1459&ttwid=1|fake|123|abc&xsack=1&xaack=1&xsqos=0",
+        )
+        self.assertNotIn("fake-sid", url)
+        self.assertNotIn("fake_tok", url)
+        self.assertIn("access_key=277f7a051d7a540326780c413dbc2b9c", build_ws_url({}))
+        self.assertNotIn("ttwid=", build_ws_url({}))
+
+    def test_ws_auth_file_pair_is_validated_and_overrides_session_ttwid(self):
+        from client import apply_ws_auth, load_ws_auth
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "ws_auth.local.json"
+            self.assertEqual(load_ws_auth(str(path)), {})
+            path.write_text(json.dumps({"ttwid": "1%7Cfake-Id_1%7C123%7Cabc", "access_key": "AB" * 16}), encoding="utf-8")
+            auth = load_ws_auth(str(path))
+            self.assertEqual(auth, {"ttwid": "1|fake-Id_1|123|abc", "access_key": "ab" * 16})
+            for bad in ({"ttwid": "x", "access_key": "ab" * 16}, {"ttwid": "1|a|1|b", "access_key": "zz"}, []):
+                with self.subTest(bad=bad):
+                    path.write_text(json.dumps(bad), encoding="utf-8")
+                    with self.assertRaises(ValueError) as caught:
+                        load_ws_auth(str(path))
+                    self.assertNotIn("ab" * 16, str(caught.exception))
+        session = {"sessionid": "fake-sid", "ttwid": "1|session|1|aa"}
+        self.assertEqual(apply_ws_auth(session, auth)["ttwid"], "1|fake-Id_1|123|abc")
+        self.assertEqual(session["ttwid"], "1|session|1|aa")
+        self.assertIs(apply_ws_auth(session, {}), session)
+
+    def test_ws_handshake_rejection_logs_safe_diagnostics_and_sends_nothing(self):
+        from unittest.mock import AsyncMock
+        from websockets.datastructures import Headers
+        from websockets.exceptions import InvalidStatus
+        from websockets.http11 import Response
+
+        cookies = {"sessionid": "fake-secret-sid", "msToken": "fake-secret-mstoken", "ttwid": "1|fake-secret-ttwid"}
+        response = Response(400, "Bad Request", Headers({
+            "Handshake-Msg": "fake handshake reason",
+            "Set-Cookie": "sessionid=fake-secret-setcookie",
+        }), body=b'{"msToken":"fake-secret-body"}')
+        connect = AsyncMock(side_effect=InvalidStatus(response))
+        send_target = AsyncMock()
+        with tempfile.TemporaryDirectory() as tmp:
+            plan = Path(tmp) / "plan.json"
+            plan.write_text(json.dumps({"session": "fake", "message": "hi",
+                                        "targets": [{"conv_id": "0:1:1:2", "conv_short_id": 7, "conv_type": 1}]}),
+                            encoding="utf-8")
+            output = io.StringIO()
+            with patch.object(oneshot, "load_session", return_value=dict(cookies)), \
+                    patch.object(oneshot, "get_own_user_id", return_value="111"), \
+                    patch.object(ledger, "RunLock", lambda *a, **k: contextlib.nullcontext()), \
+                    patch("websockets.connect", connect), \
+                    patch.object(oneshot, "_send_target_oneshot", send_target), \
+                    contextlib.redirect_stdout(output):
+                with self.assertRaises(InvalidStatus):
+                    asyncio.run(oneshot.run_oneshot_send(config_path=str(plan), validate_server=False,
+                                                         db_path=str(Path(tmp) / "ledger.db")))
+        send_target.assert_not_called()
+        self.assertIn("ttwid=1|fake-secret-ttwid", connect.call_args.args[0])
+        text = output.getvalue()
+        self.assertIn("im-ws-sg.tiktok.com/ws/v2", text)
+        self.assertIn("query params: device_platform, version_code, access_key, fpid, aid, ttwid, xsack", text)
+        self.assertIn("handshake-msg: fake handshake reason", text)
+        self.assertIn("response: 400", text)
+        self.assertNotIn("fake-secret", text)
+
+    def test_ws_probe_handshakes_then_closes_without_sending_frames(self):
+        from unittest.mock import AsyncMock, MagicMock
+        ws = MagicMock()
+        ws.send, ws.recv, ws.close = AsyncMock(), AsyncMock(), AsyncMock()
+        connect = AsyncMock(return_value=ws)
+        cookies = {"sessionid": "fake-sid", "ttwid": "1|fake", "msToken": "fake"}
+        with patch.object(oneshot, "load_session", return_value=cookies), \
+                patch.object(oneshot, "load_ws_auth", return_value={"ttwid": "1|browser|1|bb", "access_key": "c" * 32}), \
+                patch("websockets.connect", connect), \
+                patch.object(ledger, "RunLock") as run_lock, \
+                contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(main.cmd_ws_probe("fake", host="im-ws-va.tiktok.com"), 0)
+        url = connect.call_args.args[0]
+        self.assertTrue(url.startswith("wss://im-ws-va.tiktok.com/ws/v2?"))
+        self.assertIn(f"access_key={'c' * 32}&fpid=9&aid=1459&ttwid=1|browser|1|bb&", url)
+        cookie_hdr = dict(connect.call_args.kwargs["additional_headers"])["Cookie"]
+        self.assertIn("ttwid=1|browser|1|bb", cookie_hdr)
+        self.assertNotIn("1|fake", cookie_hdr)
+        self.assertNotIn("c" * 32, output.getvalue())
+        ws.close.assert_awaited_once()
+        ws.send.assert_not_called()
+        ws.recv.assert_not_called()
+        run_lock.assert_not_called()
+        self.assertIn("No message was transmitted", output.getvalue())
+
+    def test_ws_probe_refuses_non_tiktok_ws_host_before_connecting(self):
+        from unittest.mock import AsyncMock
+        connect = AsyncMock()
+        for host in ("evil.example.com", "im-ws-sg.tiktok.com.evil.com", "www.tiktok.com", "user@im-ws.tiktok.com"):
+            with self.subTest(host=host), \
+                    patch.object(oneshot, "load_session", return_value={"sessionid": "fake-sid"}), \
+                    patch("websockets.connect", connect), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(main.cmd_ws_probe("fake", host=host), 1)
+        connect.assert_not_called()
+
+    def test_ws_probe_reports_rejection_without_secrets(self):
+        from unittest.mock import AsyncMock
+        from websockets.datastructures import Headers
+        from websockets.exceptions import InvalidStatus
+        from websockets.http11 import Response
+        response = Response(400, "Bad Request", Headers({"Handshake-Msg": "authentication failed"}), body=b"")
+        with patch.object(oneshot, "load_session", return_value={"sessionid": "fake-secret-sid", "ttwid": "fake-secret-tw"}), \
+                patch("websockets.connect", AsyncMock(side_effect=InvalidStatus(response))), \
+                contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(main.cmd_ws_probe("fake"), 1)
+        self.assertIn("handshake-msg: authentication failed", output.getvalue())
+        self.assertIn("HTTP 400", output.getvalue())
+        self.assertNotIn("fake-secret", output.getvalue())
+
+    def test_qr_login_keeps_ttwid_from_login_cookie_jar(self):
+        from types import SimpleNamespace as C
+        jar = [C(name="ttwid", value="1|fake"), C(name="tt_chain_token", value="fake"), C(name="sessionid", value="old")]
+        merged = qrlogin._merge_jar_cookies({"sessionid": "confirmed"}, jar)
+        self.assertEqual(merged, {"sessionid": "confirmed", "ttwid": "1|fake"})
+        self.assertEqual(qrlogin._merge_jar_cookies({"ttwid": "server"}, jar)["ttwid"], "server")
+
     def test_session_read_fails_before_open_when_chmod_fails(self):
         with tempfile.TemporaryDirectory() as tmp:
             session = Path(tmp) / "fake.json"

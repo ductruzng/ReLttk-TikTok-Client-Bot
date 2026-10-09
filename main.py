@@ -231,7 +231,38 @@ def cmd_send(config_path: str = DEFAULT_CONFIG_FILE) -> int:
             return 1
         return 0
     except Exception as e:
-        print(f"\n[!] Send execution failed: {type(e).__name__}")
+        if not _report_ws_rejection(e):
+            print(f"\n[!] Send execution failed: {type(e).__name__}")
+        return 1
+
+
+def _report_ws_rejection(e: Exception) -> bool:
+    """Print a status-only summary for a rejected WS upgrade; return False if e is something else."""
+    if type(e).__name__ != "InvalidStatus":
+        return False
+    status = getattr(getattr(e, "response", None), "status_code", None)
+    label = f"HTTP {status}" if type(status) is int and 100 <= status <= 599 else "HTTP status unavailable"
+    print(f"\n[!] WebSocket upgrade rejected ({label}). No message was transmitted.")
+    print("    See the 'WS handshake rejected' diagnostics above. If ttwid is missing, re-run 'python main.py login'.")
+    return True
+
+
+def cmd_ws_probe(session_name: str, host: Optional[str] = None) -> int:
+    """Handshake-only WebSocket check; never sends any frame or message."""
+    session_name = (session_name or "").strip()
+    if not session_name or not re.match(r'^[a-zA-Z0-9_\.-]+$', session_name) or ".." in session_name:
+        print("[!] Invalid session name.")
+        return 1
+    try:
+        import asyncio
+        import oneshot
+        asyncio.run(oneshot.probe_ws_handshake(session_name, host=host))
+        print("\n[+] WebSocket handshake succeeded. No message was transmitted.")
+        return 0
+    except Exception as e:
+        if not _report_ws_rejection(e):
+            print(f"\n[!] WebSocket probe failed: {type(e).__name__}: {e}" if isinstance(e, ValueError)
+                  else f"\n[!] WebSocket probe failed: {type(e).__name__}")
         return 1
 
 
@@ -370,6 +401,13 @@ def main() -> int:
 
     subparsers.add_parser("status", help="Inspect local SQLite ledger records in readonly mode")
 
+    probe_parser = subparsers.add_parser(
+        "ws-probe",
+        help="Handshake-only WebSocket check (connects and closes; never sends a message)",
+    )
+    probe_parser.add_argument("--session", "-s", required=True, help="Session name to use (required)")
+    probe_parser.add_argument("--host", help="Override WS host, e.g. im-ws-sg.tiktok.com (im-ws*.tiktok.com only)")
+
     args = parser.parse_args()
 
     # Reject mode flags with subcommands before any network activity
@@ -382,6 +420,8 @@ def main() -> int:
         return cmd_list_conversations(session_name=args.session)
     elif args.command == "status":
         return cmd_status(config_path=args.config)
+    elif args.command == "ws-probe":
+        return cmd_ws_probe(session_name=args.session, host=args.host)
 
     if args.send:
         return cmd_send(config_path=args.config)

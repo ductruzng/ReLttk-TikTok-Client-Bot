@@ -417,6 +417,18 @@ def _handle_2fa(opener, passport_ticket: str) -> bool:
         return False
 
 
+# Cookies issued earlier in the login flow (not by check_qrconnect) that the IM WebSocket handshake needs
+_JAR_COOKIES_TO_KEEP = ("ttwid",)
+
+
+def _merge_jar_cookies(cookies: dict, jar) -> dict:
+    """Add handshake cookies (e.g. ttwid) from the login cookie jar without overriding confirmed ones."""
+    for c in jar:
+        if c.name in _JAR_COOKIES_TO_KEEP and c.value and not cookies.get(c.name):
+            cookies[c.name] = c.value
+    return cookies
+
+
 def _try_login(did: str) -> dict | None:
 
     jar = http.cookiejar.CookieJar()
@@ -585,7 +597,7 @@ def _try_login(did: str) -> dict | None:
                             k, v = cookie_part.split("=", 1)
                             if v:
                                 cookies[k.strip()] = v.strip()
-                return cookies
+                return _merge_jar_cookies(cookies, jar)
 
             _stop_event.wait(2)
     except KeyboardInterrupt:

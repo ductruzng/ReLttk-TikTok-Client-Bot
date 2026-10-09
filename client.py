@@ -22,7 +22,59 @@ except ImportError:
     import log as _log
     from core import build_ws_packet, build_reaction_packet, build_delete_packet, build_delete_everyone_packet, build_video_share_packet, get_user_profiles, get_own_user_id, get_item_detail, get_music_detail, get_group_names, get_conversation_history, get_conversations_api, get_pending_strangers, accept_stranger, block_user
 
-_USER_CACHE_TTL = 60           
+_USER_CACHE_TTL = 60
+
+
+_RE_ACCESS_KEY = re.compile(r"^[0-9a-f]{32}$")
+_RE_TTWID = re.compile(r"^1\|[A-Za-z0-9_-]+\|\d+\|[0-9a-f]+$")
+
+
+def load_ws_auth(path: str | None = None) -> dict:
+    """Load a browser-issued {ttwid, access_key} pair from the local (gitignored) auth file.
+
+    The WS gateway answers "authentication failed" unless access_key matches the ttwid
+    it was issued for. Returns {} when the file is absent; raises ValueError if malformed.
+    """
+    import json
+    import urllib.parse
+    path = path or os.path.join(os.path.dirname(os.path.abspath(__file__)), config.WS_AUTH_FILE)
+    if not os.path.exists(path):
+        return {}
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    if not isinstance(data, dict):
+        raise ValueError(f"{config.WS_AUTH_FILE} must contain a JSON object")
+    ttwid = urllib.parse.unquote(str(data.get("ttwid", "")).strip())
+    access_key = str(data.get("access_key", "")).strip().lower()
+    if not _RE_TTWID.match(ttwid) or not _RE_ACCESS_KEY.match(access_key):
+        raise ValueError(f"{config.WS_AUTH_FILE} needs 'ttwid' (1|...|...|...) and a 32-hex 'access_key' "
+                         "copied from the same browser WebSocket request")
+    return {"ttwid": ttwid, "access_key": access_key}
+
+
+def apply_ws_auth(cookies: dict, ws_auth: dict) -> dict:
+    """Return cookies with the configured browser ttwid so Cookie header and URL agree."""
+    if ws_auth.get("ttwid"):
+        return {**cookies, "ttwid": ws_auth["ttwid"]}
+    return cookies
+
+
+def build_ws_url(cookies: dict, base_url: str | None = None, access_key: str | None = None) -> str:
+    """Build the WS handshake URL in the same shape the TikTok web client sends.
+
+    ttwid comes from the (possibly ws_auth-overridden) cookies; access_key must be the
+    one issued for that ttwid, otherwise the gateway rejects with "authentication failed".
+    """
+    import urllib.parse
+    url = base_url or config.WS_URL
+    params = [("access_key", access_key or config.WS_ACCESS_KEY), ("fpid", config.WS_FPID), ("aid", config.WS_AID)]
+    ttwid = (cookies or {}).get("ttwid")
+    if ttwid:
+        params.append(("ttwid", urllib.parse.quote(urllib.parse.unquote(ttwid), safe="|")))
+    query = "&".join(f"{k}={v}" for k, v in params if f"{k}=" not in url)
+    if config.WS_EXTRA_PARAMS:
+        query += "&" + config.WS_EXTRA_PARAMS
+    return url + ("&" if "?" in url else "?") + query
 
 class _BotRestart(Exception): pass
 class _BotStop(Exception): pass
@@ -1557,11 +1609,12 @@ class LttkClient:
             else:
                 _log.warn("lttk", f"no se pudo verificar sesion ({e}), continuando...")
 
+        ws_auth = load_ws_auth()
         while True:
             _log.info("lttk", "conectando...")
             try:
                 async with websockets.connect(
-                    self._ws_url,
+                    build_ws_url(apply_ws_auth(self._cookies, ws_auth), self._ws_url, ws_auth.get("access_key")),
                     **{_WS_HEADERS_KW: self._headers},
                     subprotocols=self._subprotocols,
                     ssl=ssl_ctx,

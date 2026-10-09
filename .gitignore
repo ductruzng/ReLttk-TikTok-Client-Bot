@@ -18,6 +18,7 @@ state/
 
 # Personal config and local overrides
 streak.local.json
+ws_auth.local.json
 config.local.py
 personal_config.json
 

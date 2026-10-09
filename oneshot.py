@@ -1,20 +1,64 @@
 import asyncio
 import json
 import os
+import re
 import ssl
 import sys
 import time
 import uuid
 from typing import Optional, Tuple
+from urllib.parse import urlsplit, urlunsplit
 
 import config
 import ledger
 import log as _log
-from client import LttkClient
+from client import LttkClient, apply_ws_auth, build_ws_url, load_ws_auth
 from core.api import get_conversations, get_own_user_id
 from core.proto import build_ws_packet
 from main import validate_config_data
 from qrlogin import load_session
+
+
+_SAFE_RESPONSE_HEADERS = (
+    "handshake-msg", "handshake-status", "x-tt-logid", "server", "content-type", "content-length",
+)
+
+
+def describe_ws_rejection(exc, url: str, headers: list[tuple[str, str]], cookies: dict) -> list[str]:
+    """Summarize a rejected WS upgrade without exposing cookie/token/session values.
+
+    Only names are reported for query params, request headers, and cookies; response
+    headers are whitelisted (Set-Cookie is never included) and values are redacted.
+    """
+    from urllib.parse import urlsplit, parse_qsl
+
+    def _clip(value, limit: int = 200) -> str:
+        text = "".join(ch if ch.isprintable() else "?" for ch in str(value))
+        return _log.redact(text[:limit])
+
+    parts = urlsplit(url)
+    lines = [
+        f"endpoint: {parts.hostname}{parts.path}",
+        "query params: " + ", ".join(k for k, _ in parse_qsl(parts.query, keep_blank_values=True)),
+        "request headers: " + ", ".join(k for k, _ in headers),
+        "cookie names: " + ", ".join(sorted(cookies)),
+        f"ttwid present: {bool(cookies.get('ttwid'))}, msToken present: {bool(cookies.get('msToken'))}",
+    ]
+    response = getattr(exc, "response", None)
+    if response is None:
+        lines.append("response: unavailable")
+        return lines
+    lines.append(f"response: {getattr(response, 'status_code', '?')} {_clip(getattr(response, 'reason_phrase', ''), 60)}")
+    resp_headers = getattr(response, "headers", None)
+    if resp_headers is not None:
+        for name in _SAFE_RESPONSE_HEADERS:
+            value = resp_headers.get(name)
+            if value:
+                lines.append(f"response header {name}: {_clip(value)}")
+    body = getattr(response, "body", None)
+    if body:
+        lines.append(f"response body ({len(body)} bytes): {_clip(body.decode('utf-8', errors='replace'))}")
+    return lines
 
 
 def validate_against_server_inbox(cookies: dict, targets: list[dict], device_id: str | None = None) -> None:
@@ -184,6 +228,86 @@ async def _send_target_oneshot(
         return {"conv_id": conv_id, "status": ledger.STATUS_FAILED_UNKNOWN, "reason": failure_reason}
 
 
+_RE_TIKTOK_WS_HOST = re.compile(r"^im-ws(?:-[a-z0-9]+)?\.tiktok\.com$")
+
+
+def with_ws_host(url: str, host: str) -> str:
+    """Swap the WS host; only im-ws*.tiktok.com is allowed so cookies never go elsewhere."""
+    host = (host or "").strip().lower()
+    if not _RE_TIKTOK_WS_HOST.match(host):
+        raise ValueError(f"Refusing WebSocket host {host!r}: must look like im-ws-<region>.tiktok.com")
+    parts = urlsplit(url)
+    return urlunsplit(parts._replace(netloc=host))
+
+
+def _prepare_ws(cookies: dict) -> tuple[dict, str]:
+    """Apply the local browser ttwid/access_key pair (if any) and build the handshake URL."""
+    ws_auth = load_ws_auth()
+    if ws_auth:
+        _log.info("oneshot", f"WS auth: using ttwid/access_key pair from {config.WS_AUTH_FILE}")
+    else:
+        _log.warn("oneshot", f"WS auth: {config.WS_AUTH_FILE} not found; using built-in access_key, "
+                             "which only matches the upstream ttwid and will likely be rejected")
+    ws_cookies = apply_ws_auth(cookies, ws_auth)
+    return ws_cookies, build_ws_url(ws_cookies, access_key=ws_auth.get("access_key"))
+
+
+async def _open_ws(cookies: dict, ws_url: str):
+    """Perform the verified-TLS WS handshake; log safe diagnostics if the server rejects it."""
+    import websockets
+    from websockets.exceptions import InvalidStatus
+
+    ssl_ctx = ssl.create_default_context()
+    ssl_ctx.check_hostname = True
+    ssl_ctx.verify_mode = ssl.CERT_REQUIRED
+
+    cookie_hdr = "; ".join(f"{k}={v}" for k, v in cookies.items())
+    headers = [
+        ("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36"),
+        ("Origin", "https://www.tiktok.com"),
+        ("Cookie", cookie_hdr),
+        ("Pragma", "no-cache"),
+        ("Cache-Control", "no-cache"),
+    ]
+    ws_kw = "additional_headers" if tuple(int(x) for x in websockets.__version__.split(".")[:2]) >= (14, 0) else "extra_headers"
+
+    if not cookies.get("ttwid"):
+        _log.warn("oneshot", "Session has no ttwid cookie; the WebSocket gateway may reject the upgrade. "
+                             "Re-run 'python main.py login' to refresh the session.")
+
+    _log.info("oneshot", f"Connecting to TikTok WebSocket ({urlsplit(ws_url).hostname}) with verified TLS...")
+    try:
+        return await websockets.connect(
+            ws_url,
+            **{ws_kw: headers},
+            subprotocols=["binary", "base64", "pbbp2"],
+            ssl=ssl_ctx,
+            ping_interval=20,
+            ping_timeout=10,
+        )
+    except InvalidStatus as e:
+        for line in describe_ws_rejection(e, ws_url, headers, cookies):
+            _log.error("oneshot", f"WS handshake rejected - {line}")
+        raise
+
+
+async def probe_ws_handshake(session_name: str, host: str | None = None) -> None:
+    """Handshake-only diagnostic: connect, then close immediately.
+
+    Sends no frames at all (not even the "hi" ping), touches no ledger and reads no
+    streak config, so it can never transmit a message.
+    """
+    cookies = load_session(session_name)
+    if not cookies or not cookies.get("sessionid"):
+        raise ValueError(f"Session '{session_name}' not found or missing sessionid cookie.")
+    ws_cookies, ws_url = _prepare_ws(cookies)
+    if host:
+        ws_url = with_ws_host(ws_url, host)
+    connection = await _open_ws(ws_cookies, ws_url)
+    await connection.close()
+    _log.ok("oneshot", f"Handshake OK on {urlsplit(ws_url).hostname}; connection closed without sending any frame.")
+
+
 async def run_oneshot_send(
     config_path: str = "streak.json",
     timeout_seconds: float = 20.0,
@@ -225,33 +349,9 @@ async def run_oneshot_send(
 
     # Acquire process run lock
     with ledger.RunLock():
-        # Setup TLS verified context
-        ssl_ctx = ssl.create_default_context()
-        ssl_ctx.check_hostname = True
-        ssl_ctx.verify_mode = ssl.CERT_REQUIRED
-
-        cookie_hdr = "; ".join(f"{k}={v}" for k, v in cookies.items())
-        headers = [
-            ("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36"),
-            ("Origin", "https://www.tiktok.com"),
-            ("Cookie", cookie_hdr),
-            ("Pragma", "no-cache"),
-            ("Cache-Control", "no-cache"),
-        ]
-
-        import websockets
-        ws_kw = "additional_headers" if tuple(int(x) for x in websockets.__version__.split(".")[:2]) >= (14, 0) else "extra_headers"
-
         results = []
-        _log.info("oneshot", "Connecting to TikTok WebSocket with verified TLS...")
-        async with websockets.connect(
-            config.WS_URL,
-            **{ws_kw: headers},
-            subprotocols=["binary", "base64", "pbbp2"],
-            ssl=ssl_ctx,
-            ping_interval=20,
-            ping_timeout=10,
-        ) as ws:
+        connection = await _open_ws(*_prepare_ws(cookies))
+        async with connection as ws:
             _log.ok("oneshot", "Connected to WebSocket. Processing targets sequentially...")
             # Handshake ping
             await asyncio.wait_for(ws.send("hi"), timeout=5.0)
