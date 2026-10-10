@@ -1,5 +1,5 @@
-"""Termux CLI for TikTok Streak Manager.
-Phase A: CLI without background scheduler.
+"""Command Line Interface for TikTok Streak Manager.
+Phase A: Interactive CLI.
 """
 
 import argparse
@@ -14,7 +14,7 @@ if sys.stdout and sys.stdout.encoding.lower() != 'utf-8':
 import main as main_cli
 import oneshot
 import ledger
-from tui_services import (
+from services import (
     list_sessions, fetch_inbox, save_plan, Conversation,
     CONFIG_PATH, PREFS_PATH, read_json_object, save_preferences
 )
@@ -27,7 +27,7 @@ def clear_screen():
 def print_header():
     clear_screen()
     print("==========================")
-    print(" TikTok Streak Manager")
+    print(" TikTok Streak Manager CLI")
     print("==========================")
 
 
@@ -61,7 +61,7 @@ def menu_manage_accounts():
     for i, s in enumerate(sessions, 1):
         print(f" {i}. {s}")
     
-    print("\nLưu ý: Để thêm tài khoản, chạy 'python main.py login' và 'python main.py capture-ws-auth' trên Windows, sau đó chuyển file session/ và ws_auth.local.json sang Termux.")
+    print("\nLưu ý: Để thêm tài khoản, chạy 'python main.py login' và 'python main.py capture-ws-auth'.")
     input("\nNhấn Enter để quay lại...")
 
 
@@ -72,7 +72,7 @@ def menu_list_conversations():
     if not session:
         sessions = list_sessions()
         if not sessions:
-            print("Chưa có tài khoản. Vui lòng chuyển session từ Windows sang.")
+            print("Chưa có tài khoản. Vui lòng login trước.")
             input("\nNhấn Enter để quay lại...")
             return
         session = sessions[0]
@@ -149,15 +149,18 @@ def menu_select_targets():
 def menu_config_message():
     print("\n--- [4] Cấu hình nội dung ---")
     cfg = read_json_object(CONFIG_PATH)
+    if 'rotation' in cfg:
+        print("Plan đang dùng rotation. Hãy chỉnh rotation.templates trong file cấu hình; menu này chỉ sửa tin cố định.")
+        input("\nNhấn Enter để quay lại...")
+        return
     old_msg = cfg.get("message", "(Chưa có)")
     print(f"Nội dung hiện tại: {old_msg}")
     new_msg = input("Nhập nội dung mới (để trống để giữ nguyên): ").strip()
     
     if new_msg:
         try:
-            cfg["message"] = new_msg
-            import tui_services
-            tui_services.atomic_write_json(CONFIG_PATH, cfg)
+            import services
+            services.save_fixed_message(new_msg, CONFIG_PATH)
             print("Đã lưu tin nhắn.")
         except Exception as e:
             print(f"Lỗi lưu: {e}")
@@ -168,6 +171,8 @@ def menu_config_message():
 def menu_config_schedule():
     print("\n--- [5] Cấu hình lịch gửi ---")
     prefs = read_json_object(PREFS_PATH)
+    settings = read_json_object(CONFIG_PATH)
+    prefs["skip_if_sent"] = not settings.get("allow_repeat_same_day", False)
     print(f"Giờ gửi hiện tại: {prefs.get('time', '08:00')}")
     print(f"Tự động: {'Bật' if prefs.get('enabled') else 'Tắt'}")
     print(f"Chống gửi trùng: {'Bật' if prefs.get('skip_if_sent', True) else 'Tắt'}")
@@ -193,6 +198,17 @@ def menu_config_schedule():
         new_skip = prefs.get('skip_if_sent', True)
         
     try:
+        from services import save_send_settings
+        current_limit = settings.get("max_sends_per_conversation_per_day", 1)
+        entered = input(f"Hạn mức mỗi hội thoại/ngày [{current_limit}]: ").strip()
+        limit = int(entered) if entered else current_limit
+        from ledger_requests import DEFAULT_SETTINGS
+        limits = {}
+        for name in ("max_sends_per_account_per_day", "min_send_interval_seconds", "max_sends_per_window", "window_seconds"):
+            current = settings.get(name, DEFAULT_SETTINGS[name])
+            entered = input(f"{name} [{current}]: ").strip()
+            limits[name] = int(entered) if entered else current
+        save_send_settings(not new_skip, limit, **limits)
         save_preferences(new_time, new_enabled, skip_if_sent=new_skip)
         print("Đã lưu cấu hình lịch gửi.")
     except Exception as e:
@@ -231,36 +247,16 @@ def menu_send_manual():
             continue # Ignore stray newlines
             
     if confirm == "yes":
-        from tui_services import summarize_results
+        from services import summarize_results
         try:
-            prefs = read_json_object(PREFS_PATH)
-            skip_if_sent = prefs.get("skip_if_sent", True)
-
-            # Replicate TUI force-send logic
-            if not skip_if_sent and CONFIG_PATH.exists():
-                cfg = read_json_object(CONFIG_PATH)
-                targets = cfg.get("targets", [])
-                session_name = cfg.get("session")
-                if session_name and targets:
-                    from qrlogin import load_session
-                    from core.api import get_own_user_id
-                    cookies = load_session(session_name)
-                    canonical_uid = get_own_user_id(cookies)
-                    if canonical_uid:
-                        conn = ledger._get_readwrite_connection()
-                        cur = conn.cursor()
-                        today = ledger.get_current_ho_chi_minh_date()
-                        for t in targets:
-                            cur.execute(
-                                "DELETE FROM daily_ledger WHERE canonical_uid = ? AND conv_id = ? AND date = ?",
-                                (str(canonical_uid), str(t.get("conv_id")), str(today))
-                            )
-                        conn.commit()
-                        conn.close()
-
-            result = asyncio.run(oneshot.run_oneshot_send(config_path=str(CONFIG_PATH)))
+            from services import send_plan
+            import uuid
+            result = asyncio.run(send_plan(CONFIG_PATH, idempotency_key="manual:" + str(uuid.uuid4()),
+                                           confirm_request=main_cli.confirm_snapshot))
             confirmed, skipped, failed = summarize_results(result)
             print(f"\nKết quả: {confirmed} thành công, {skipped} bỏ qua, {failed} thất bại.")
+            for row in result.get("results", []):
+                print(row.get("request_id", ""), row.get("detail") or row.get("reason", ""))
         except Exception as e:
             print(f"Lỗi khi gửi: {e}")
     else:
@@ -285,8 +281,8 @@ def interactive_mode():
         print_header()
         st = get_cli_status()
         print(f"Account: {st['account']}")
-        print("Login: Active") # Placeholder
-        print("WebSocket: Ready") # Placeholder
+        print("Login: Chưa kiểm tra")
+        print("WebSocket: Chưa kiểm tra (dùng mục 7 để probe)")
         print(f"Scheduler: {st['scheduler']}\n")
         
         print("[1] Quản lý tài khoản")
@@ -331,7 +327,7 @@ def interactive_mode():
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="TikTok Streak Manager CLI for Termux")
+    parser = argparse.ArgumentParser(description="TikTok Streak Manager CLI")
     subparsers = parser.add_subparsers(dest="command", help="CLI commands")
     
     subparsers.add_parser("status", help="Xem trạng thái ledger")

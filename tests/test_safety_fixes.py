@@ -12,10 +12,11 @@ from unittest.mock import AsyncMock, patch
 
 import client
 import ledger
+from ledger_fixtures import reserve_at, initialize_fixture
 import main
 import oneshot
 import qrlogin
-import tui_services as services
+import services
 import ws_auth_capture as capture
 
 
@@ -43,11 +44,11 @@ class SafetyFixTests(unittest.TestCase):
     def test_force_cannot_erase_pending_or_history(self):
         with tempfile.TemporaryDirectory() as tmp:
             db = str(Path(tmp) / "ledger.db")
-            ledger.reserve_pending("111", "conv", "old", date="2026-10-08", db_path=db)
+            reserve_at("111", "conv", "old", date="2026-10-08", db_path=db)
             with self.assertRaises(TypeError):
-                ledger.reserve_pending("111", "conv", "new", date="2026-10-09", db_path=db, force=True)
+                reserve_at("111", "conv", "new", date="2026-10-09", db_path=db, force=True)
             with self.assertRaises(ledger.QuotaExceededError):
-                ledger.reserve_pending("111", "conv", "new", date="2026-10-09", db_path=db)
+                reserve_at("111", "conv", "new", date="2026-10-09", db_path=db)
             self.assertEqual(ledger.is_already_attempted("111", "conv", "2026-10-08", db), (True, "pending"))
 
     def test_tui_rejects_invalid_target_before_replacing_plan(self):

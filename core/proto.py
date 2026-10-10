@@ -201,16 +201,16 @@ def _build_reaction_body(conv_id: str, short_id: int, msg_type: int,
 
 
 def _build_reaction_request_body(react_body: bytes, device_id: str, sdk_ms_token: str,
-                                  tt_public_key: str, tt_client_data: str) -> bytes:
+                                  tt_public_key: str, tt_client_data: str, platform="windows", device_platform="web_pc") -> bytes:
     ctx = [
         ("aid",             "1988"),
         ("app_name",        "tiktok_web"),
         ("channel",         "web"),
-        ("device_platform", "web_pc"),
+        ("device_platform", device_platform),
         ("device_id",       device_id),
         ("region",          "CO"),
         ("priority_region", "CO"),
-        ("os",              "windows"),
+        ("os",              platform),
         ("referer",         "https://www.tiktok.com/messages?lang=es-419"),
         ("root_referer",    ""),
         ("cookie_enabled",  "true"),
@@ -258,16 +258,16 @@ def _build_reaction_request_body(react_body: bytes, device_id: str, sdk_ms_token
 
 
 def _build_request_body(msg_body: bytes, device_id: str, sdk_ms_token: str,
-                        tt_public_key: str, tt_client_data: str) -> bytes:
+                        tt_public_key: str, tt_client_data: str, platform="windows", device_platform="web_pc") -> bytes:
     ctx = [
         ("aid",             "1988"),
         ("app_name",        "tiktok_web"),
         ("channel",         "web"),
-        ("device_platform", "web_pc"),
+        ("device_platform", device_platform),
         ("device_id",       device_id),
         ("region",          "CO"),
         ("priority_region", "CO"),
-        ("os",              "windows"),
+        ("os",              platform),
         ("referer",         "https://www.tiktok.com/messages?lang=es-419"),
         ("root_referer",    ""),
         ("cookie_enabled",  "true"),
@@ -328,6 +328,8 @@ def build_ws_packet(
     awe_type: int | None = None,
     conv_type: int | None = None,
     client_id: str | None = None,
+    platform: str = "windows",
+    device_platform: str = "web_pc",
 ) -> tuple[bytes, int, str]:
     if client_id is None:
         client_id = str(uuid.uuid4())
@@ -347,8 +349,11 @@ def build_ws_packet(
         awe_type=awe_type,
         conv_type=conv_type,
     )
-    request_body = _build_request_body(msg_body, device_id, sdk_ms_token,
-                                       tt_public_key, tt_client_data)
+    request_body = _build_request_body(
+        msg_body, device_id, sdk_ms_token,
+        tt_public_key=tt_public_key, tt_client_data=tt_client_data,
+        platform=platform, device_platform=device_platform,
+    )
 
     raw_for_sign = (
         f_varint(1, CMD) +
@@ -365,11 +370,11 @@ def build_ws_packet(
         ("aid",             "1988"),
         ("app_name",        "tiktok_web"),
         ("channel",         "web"),
-        ("device_platform", "web_pc"),
+        ("device_platform", device_platform),
         ("device_id",       device_id),
         ("region",          "CO"),
         ("priority_region", "CO"),
-        ("os",              "windows"),
+        ("os",              platform),
         ("referer",         "https://www.tiktok.com/messages?lang=es-419"),
         ("root_referer",    ""),
         ("cookie_enabled",  "true"),
@@ -421,8 +426,10 @@ def build_video_share_packet(
     client_id    = str(uuid.uuid4())
     seq_id       = int(time.time() * 1000)
     msg_body     = _build_video_share_body(conv_id, short_id, item_detail, client_id)
-    request_body = _build_request_body(msg_body, device_id, sdk_ms_token,
-                                       tt_public_key, tt_client_data)
+    request_body = _build_request_body(
+        msg_body, device_id, sdk_ms_token,
+        tt_public_key=tt_public_key, tt_client_data=tt_client_data,
+    )
     raw_for_sign = (
         f_varint(1, CMD) +
         f_varint(2, seq_id) +
@@ -497,8 +504,10 @@ def build_reaction_packet(
     CMD_DELETE_FRAME  = CMD_UNREACT_FRAME if remove else CMD_REACT_FRAME
 
     react_body   = _build_reaction_body(conv_id, short_id, msg_type, emoji, sender_id, client_id, remove)
-    request_body = _build_reaction_request_body(react_body, device_id, sdk_ms_token,
-                                                tt_public_key, tt_client_data)
+    request_body = _build_reaction_request_body(
+        react_body, device_id, sdk_ms_token,
+        tt_public_key=tt_public_key, tt_client_data=tt_client_data,
+    )
 
     raw_for_sign = (
         f_varint(1, CMD_DELETE_FRAME) +

@@ -1,6 +1,7 @@
 import os
 import sqlite3
 import sys
+from pathlib import Path
 from datetime import datetime
 from typing import Tuple, Optional
 
@@ -57,6 +58,10 @@ class LedgerError(Exception):
 class QuotaExceededError(LedgerError):
     """Raised when an attempt has already been reserved or confirmed today."""
     pass
+
+
+class SchemaError(LedgerError, ValueError):
+    """Safe local diagnostic, suitable for CLI display without credential values."""
 
 
 class LockError(LedgerError):
@@ -122,38 +127,43 @@ def _init_db(conn: sqlite3.Connection) -> None:
             pass
     # synchronous = FULL ensures durable fsync before network send
     conn.execute("PRAGMA synchronous = FULL")
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS daily_ledger (
-            canonical_uid TEXT NOT NULL,
-            conv_id TEXT NOT NULL,
-            date TEXT NOT NULL,
-            status TEXT NOT NULL,
-            attempt_time TEXT NOT NULL,
-            client_msg_id TEXT NOT NULL,
-            server_msg_id TEXT,
-            confirmed_time TEXT,
-            reason_code TEXT,
-            PRIMARY KEY (canonical_uid, conv_id, date)
-        )
-    """)
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_ledger_lookup ON daily_ledger(canonical_uid, conv_id, date)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_ledger_pending ON daily_ledger(canonical_uid, conv_id, status)")
-    conn.commit()
+
 
 
 def _get_readwrite_connection(db_path: str = _DEFAULT_LEDGER_PATH) -> sqlite3.Connection:
-    """Open read-write database connection, initializing file and tables if needed."""
-    if os.path.exists(db_path) and os.path.islink(db_path):
-        raise PermissionError(f"Symlinks are rejected for ledger database: {db_path}")
+    """Open an existing V5 database; sending never initializes or migrates."""
+    if not os.path.isfile(db_path) or os.path.islink(db_path):
+        raise LedgerError("Ledger missing or unsafe; explicit ledger-initialize is required")
+    conn = sqlite3.connect(Path(db_path).absolute().as_uri() + "?mode=rw", uri=True,
+                           timeout=30.0, isolation_level=None)
+    try:
+        from ledger_migrations import validate_schema
+        try:
+            validate_schema(conn)
+        except ValueError as exc:
+            raise SchemaError(str(exc)) from exc
+        conn.execute("PRAGMA synchronous=FULL")
+        conn.execute("PRAGMA foreign_keys=ON")
+        return conn
+    except BaseException:
+        conn.close()
+        raise
 
-    parent_dir = os.path.dirname(os.path.abspath(db_path))
-    _secure_state_dir(parent_dir)
 
-    conn = sqlite3.connect(db_path, timeout=30.0, isolation_level=None)
-    conn.execute("PRAGMA busy_timeout = 30000")
-    _init_db(conn)
-    _secure_file_permissions(db_path)
-    return conn
+def check_ready(db_path=_DEFAULT_LEDGER_PATH):
+    """Read-only schema gate to run before loading credentials or accessing TikTok."""
+    conn = _get_readonly_connection(db_path)
+    if conn is None:
+        raise LedgerError("Ledger missing; run explicit ledger-initialize with the intended path")
+    try:
+        from ledger_migrations import validate_schema
+        try:
+            validate_schema(conn)
+        except ValueError as exc:
+            raise SchemaError(str(exc)) from exc
+    finally:
+        conn.close()
+
 
 
 def _get_readonly_connection(db_path: str = _DEFAULT_LEDGER_PATH) -> Optional[sqlite3.Connection]:
@@ -166,9 +176,8 @@ def _get_readonly_connection(db_path: str = _DEFAULT_LEDGER_PATH) -> Optional[sq
     if os.path.islink(db_path):
         raise PermissionError(f"Symlinks are rejected for ledger database: {db_path}")
 
-    abs_path = os.path.abspath(db_path)
-    # Use SQLite URI mode=ro to ensure no file or sidecar creation
-    conn = sqlite3.connect(f"file:{abs_path}?mode=ro", uri=True, timeout=10.0)
+    # URI encoding also handles spaces, '#' and '?' in fixture paths.
+    conn = sqlite3.connect(Path(db_path).absolute().as_uri() + "?mode=ro", uri=True, timeout=10.0)
     return conn
 
 
@@ -194,263 +203,58 @@ def is_already_attempted(
         return False, None
 
     try:
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT status FROM daily_ledger WHERE canonical_uid = ? AND conv_id = ? AND date = ?",
-            (str(canonical_uid), str(conv_id), str(date))
-        )
-        row = cur.fetchone()
-        if row:
-            return True, row[0]
+        version = conn.execute("PRAGMA user_version").fetchone()[0]
+        if version in (2, 3, 4, 5):
+            row = conn.execute("SELECT status FROM send_requests WHERE canonical_uid=? AND conv_id=? AND date=? AND transmitted=1 ORDER BY attempt_time DESC LIMIT 1",
+                               (str(canonical_uid), str(conv_id), str(date))).fetchone()
+            if row:
+                return True, row[0]
+            if conn.execute("SELECT 1 FROM crossover_guards WHERE canonical_uid=? AND conv_id=? AND date=?", (str(canonical_uid), str(conv_id), str(date))).fetchone():
+                return True, STATUS_BLOCKED_CROSSOVER
+        else:
+            row = conn.execute("SELECT status FROM daily_ledger WHERE canonical_uid=? AND conv_id=? AND date=?", (str(canonical_uid), str(conv_id), str(date))).fetchone()
+            if row:
+                return True, row[0]
         return False, None
     finally:
         conn.close()
 
 
-def reserve_pending(
-    canonical_uid: str,
-    conv_id: str,
-    client_msg_id: str,
-    date: Optional[str] = None,
-    db_path: str = _DEFAULT_LEDGER_PATH
-) -> str:
-    """Atomically claim durable pending status before initiating any network send.
+def reserve_pending(canonical_uid, conv_id, client_msg_id, date=None, db_path=_DEFAULT_LEDGER_PATH):
+    """Compatibility adapter: a conservative transmission reservation, never force-delete."""
+    from ledger_requests import create_request, start_transmission
+    day = date or get_current_ho_chi_minh_date()
+    request, created = create_request(canonical_uid, conv_id, "legacy-api:" + client_msg_id,
+                                      {"client_msg_id": client_msg_id}, db_path=db_path,
+                                      client_msg_id=client_msg_id)
+    if not created:
+        raise QuotaExceededError("Reservation already exists")
+    start_transmission(request['request_id'], db_path=db_path, date=day)
+    return day
 
-    Recomputes the current date in Asia/Ho_Chi_Minh immediately before reservation.
-    Uses PRAGMA synchronous = FULL so reservation is guaranteed durable against crashes.
-    Raises QuotaExceededError if an attempt has already been reserved or confirmed today,
-    or if an unresolved pending reservation exists across dates (crash guard).
-    Returns the reserved date string (YYYY-MM-DD).
-    """
-    if not canonical_uid:
-        raise ValueError("canonical_uid is required for reservation")
-    if not conv_id:
-        raise ValueError("conv_id is required for reservation")
-    if not client_msg_id:
-        raise ValueError("client_msg_id is required for reservation")
 
-    send_date = date if date is not None else get_current_ho_chi_minh_date()
-    now_iso = datetime.now(TZ_HO_CHI_MINH).isoformat()
-
-    conn = _get_readwrite_connection(db_path)
+def confirm_send(canonical_uid, conv_id, send_date, client_msg_id, server_msg_id,
+                 confirm_date=None, db_path=_DEFAULT_LEDGER_PATH):
+    from ledger_requests import finish
+    if not all((canonical_uid, conv_id, send_date, client_msg_id)):
+        raise ValueError("Reservation identity is required")
     try:
-        cur = conn.cursor()
-        cur.execute("BEGIN IMMEDIATE")
-        try:
-            # 1. Crash guard: check for any unresolved pending reservation across dates
-            cur.execute(
-                "SELECT date, client_msg_id FROM daily_ledger WHERE canonical_uid = ? AND conv_id = ? AND status = ?",
-                (str(canonical_uid), str(conv_id), STATUS_PENDING)
-            )
-            pending_row = cur.fetchone()
-            if pending_row:
-                cur.execute("ROLLBACK")
-                raise QuotaExceededError(
-                    f"Target '{conv_id}' has an unresolved pending reservation from {pending_row[0]} ({pending_row[1]}). "
-                    f"Conservative crash guard blocks further sends across dates until manual review."
-                )
-
-            # 2. Check for existing record on target send_date
-            cur.execute(
-                "SELECT status FROM daily_ledger WHERE canonical_uid = ? AND conv_id = ? AND date = ?",
-                (str(canonical_uid), str(conv_id), str(send_date))
-            )
-            row = cur.fetchone()
-            if row:
-                cur.execute("ROLLBACK")
-                raise QuotaExceededError(
-                    f"Target '{conv_id}' on date '{send_date}' already has recorded status '{row[0]}'. "
-                    f"Daily quota prevents further attempts today."
-                )
-
-            cur.execute("""
-                INSERT INTO daily_ledger (canonical_uid, conv_id, date, status, attempt_time, client_msg_id, reason_code)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-            """, (str(canonical_uid), str(conv_id), str(send_date), STATUS_PENDING, now_iso, str(client_msg_id), None))
-            cur.execute("COMMIT")
-            return send_date
-        except Exception:
-            try:
-                cur.execute("ROLLBACK")
-            except Exception:
-                pass
-            raise
-    finally:
-        conn.close()
-
-
-def confirm_send(
-    canonical_uid: str,
-    conv_id: str,
-    send_date: str,
-    client_msg_id: str,
-    server_msg_id: str,
-    confirm_date: Optional[str] = None,
-    db_path: str = _DEFAULT_LEDGER_PATH
-) -> None:
-    """Record verified server confirmation.
-
-    Validates that:
-    1. A pending reservation exists for (canonical_uid, conv_id, send_date).
-    2. The record's client_msg_id matches the provided client UUID.
-    3. server_msg_id is a valid positive integer.
-
-    Handles midnight crossover conservatively: if server response arrives on a new calendar day,
-    the reservation day is confirmed and the subsequent day is conservatively guarded with
-    STATUS_BLOCKED_CROSSOVER using INSERT OR IGNORE (never overwriting an existing record).
-    """
-    if not canonical_uid or not conv_id or not send_date or not client_msg_id:
-        raise ValueError("canonical_uid, conv_id, send_date, and client_msg_id are all required")
-
-    try:
-        sid_int = int(str(server_msg_id))
-        if sid_int <= 0:
+        sid = int(str(server_msg_id))
+        if sid <= 0:
             raise ValueError()
     except (ValueError, TypeError):
-        raise ValueError(f"server_msg_id must be a positive integer, got: {server_msg_id!r}")
-
-    if confirm_date is None:
-        confirm_date = get_current_ho_chi_minh_date()
-    now_iso = datetime.now(TZ_HO_CHI_MINH).isoformat()
-
-    conn = _get_readwrite_connection(db_path)
-    try:
-        cur = conn.cursor()
-        cur.execute("BEGIN IMMEDIATE")
-        try:
-            cur.execute(
-                "SELECT status, client_msg_id FROM daily_ledger WHERE canonical_uid = ? AND conv_id = ? AND date = ?",
-                (str(canonical_uid), str(conv_id), str(send_date))
-            )
-            row = cur.fetchone()
-            if not row:
-                cur.execute("ROLLBACK")
-                raise LedgerError(
-                    f"No reservation record found for {conv_id} on {send_date}. Cannot confirm without reservation."
-                )
-
-            recorded_status, recorded_client_id = row[0], row[1]
-            if recorded_status != STATUS_PENDING:
-                cur.execute("ROLLBACK")
-                raise LedgerError(
-                    f"Reservation record for {conv_id} on {send_date} has status '{recorded_status}', expected '{STATUS_PENDING}'."
-                )
-
-            if recorded_client_id != str(client_msg_id):
-                cur.execute("ROLLBACK")
-                raise LedgerError(
-                    f"client_msg_id mismatch: reservation has '{recorded_client_id}', attempted confirmation with '{client_msg_id}'."
-                )
-
-            cur.execute("""
-                UPDATE daily_ledger
-                SET status = ?, server_msg_id = ?, confirmed_time = ?, reason_code = ?
-                WHERE canonical_uid = ? AND conv_id = ? AND date = ? AND status = ? AND client_msg_id = ?
-            """, (
-                STATUS_CONFIRMED, str(sid_int), now_iso, REASON_CONFIRMED,
-                str(canonical_uid), str(conv_id), str(send_date), STATUS_PENDING, str(client_msg_id)
-            ))
-
-            if cur.rowcount != 1:
-                cur.execute("ROLLBACK")
-                raise LedgerError("Failed to update pending reservation record to confirmed.")
-
-            # Midnight crossover handling: do NOT destroy an existing record with INSERT OR REPLACE.
-            # Use INSERT OR IGNORE so existing records on the subsequent date are preserved.
-            if confirm_date != send_date:
-                cur.execute("""
-                    INSERT OR IGNORE INTO daily_ledger
-                    (canonical_uid, conv_id, date, status, attempt_time, client_msg_id, server_msg_id, confirmed_time, reason_code)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    str(canonical_uid), str(conv_id), str(confirm_date),
-                    STATUS_BLOCKED_CROSSOVER, now_iso, str(client_msg_id),
-                    str(sid_int), now_iso, REASON_CROSSOVER_GUARD
-                ))
-
-            cur.execute("COMMIT")
-        except Exception:
-            try:
-                cur.execute("ROLLBACK")
-            except Exception:
-                pass
-            raise
-    finally:
-        conn.close()
+        raise ValueError("server_msg_id must be a positive integer")
+    finish(canonical_uid, conv_id, send_date, client_msg_id, db_path=db_path,
+           status=STATUS_CONFIRMED, reason=REASON_CONFIRMED, server_id=str(sid),
+           result_date=confirm_date or get_current_ho_chi_minh_date())
 
 
-def mark_failed_unknown(
-    canonical_uid: str,
-    conv_id: str,
-    send_date: str,
-    client_msg_id: str,
-    reason_code: str = REASON_UNKNOWN,
-    failure_date: Optional[str] = None,
-    db_path: str = _DEFAULT_LEDGER_PATH
-) -> None:
-    """Record timeout, error, or unconfirmed attempt as failed_unknown.
-
-    Blocks further attempts for the day (no automatic retries).
-    Persists safe fixed reason code only (no raw exception strings, URLs, or tokens).
-    Cannot overwrite an already confirmed record.
-    If midnight crossed, conservative guard is placed on subsequent date with INSERT OR IGNORE.
-    """
-    safe_code = _sanitize_reason_code(reason_code)
-    if failure_date is None:
-        failure_date = get_current_ho_chi_minh_date()
-    now_iso = datetime.now(TZ_HO_CHI_MINH).isoformat()
-
-    conn = _get_readwrite_connection(db_path)
-    try:
-        cur = conn.cursor()
-        cur.execute("BEGIN IMMEDIATE")
-        try:
-            cur.execute(
-                "SELECT status FROM daily_ledger WHERE canonical_uid = ? AND conv_id = ? AND date = ?",
-                (str(canonical_uid), str(conv_id), str(send_date))
-            )
-            row = cur.fetchone()
-
-            # A confirmed record must NEVER be overwritten by failure
-            if row and row[0] == STATUS_CONFIRMED:
-                cur.execute("ROLLBACK")
-                return
-
-            if row:
-                cur.execute("""
-                    UPDATE daily_ledger
-                    SET status = ?, reason_code = ?
-                    WHERE canonical_uid = ? AND conv_id = ? AND date = ? AND status != ?
-                """, (STATUS_FAILED_UNKNOWN, safe_code, str(canonical_uid), str(conv_id), str(send_date), STATUS_CONFIRMED))
-            else:
-                cur.execute("""
-                    INSERT OR IGNORE INTO daily_ledger
-                    (canonical_uid, conv_id, date, status, attempt_time, client_msg_id, reason_code)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    str(canonical_uid), str(conv_id), str(send_date),
-                    STATUS_FAILED_UNKNOWN, now_iso, str(client_msg_id), safe_code
-                ))
-
-            if failure_date != send_date:
-                cur.execute("""
-                    INSERT OR IGNORE INTO daily_ledger
-                    (canonical_uid, conv_id, date, status, attempt_time, client_msg_id, reason_code)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    str(canonical_uid), str(conv_id), str(failure_date),
-                    STATUS_BLOCKED_CROSSOVER, now_iso, str(client_msg_id), REASON_CROSSOVER_GUARD
-                ))
-
-            cur.execute("COMMIT")
-        except Exception:
-            try:
-                cur.execute("ROLLBACK")
-            except Exception:
-                pass
-            raise
-    finally:
-        conn.close()
+def mark_failed_unknown(canonical_uid, conv_id, send_date, client_msg_id,
+                        reason_code=REASON_UNKNOWN, failure_date=None, db_path=_DEFAULT_LEDGER_PATH, failure=None):
+    from ledger_requests import finish
+    finish(canonical_uid, conv_id, send_date, client_msg_id, db_path=db_path,
+           status=STATUS_FAILED_UNKNOWN, reason=_sanitize_reason_code(reason_code), failure=failure,
+           result_date=failure_date or get_current_ho_chi_minh_date())
 
 
 class RunLock:

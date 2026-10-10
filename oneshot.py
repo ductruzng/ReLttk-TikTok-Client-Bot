@@ -11,6 +11,8 @@ from urllib.parse import urlsplit, urlunsplit
 
 import config
 import ledger
+import ledger_requests
+import circuit_breaker as breaker
 import log as _log
 from client import LttkClient, apply_ws_auth, build_ws_url, load_ws_auth
 from core.api import get_conversations, get_own_user_id
@@ -75,6 +77,14 @@ async def _send_target_oneshot(
     timeout_seconds: float = 20.0,
     db_path: str = ledger._DEFAULT_LEDGER_PATH,
     device_id: str | None = None,
+    *, idempotency_key: str | None = None,
+    allow_repeat_same_day: bool = False,
+    max_sends_per_conversation_per_day: int = 1,
+    max_sends_per_account_per_day: int = 20,
+    min_send_interval_seconds: int = 60,
+    max_sends_per_window: int = 5,
+    window_seconds: int = 300,
+    rotation_config=None, existing_request=None, config_loader=None, confirm_request=None, session_name=None,
 ) -> dict:
     """Execute durable reservation, transmission, and correlated echo confirmation for one target."""
     conv_id = target["conv_id"]
@@ -85,34 +95,72 @@ async def _send_target_oneshot(
     send_date = ledger.get_current_ho_chi_minh_date()
     client_msg_id = str(uuid.uuid4())
 
-    # Check already attempted
-    attempted, status = ledger.is_already_attempted(canonical_uid, conv_id, date=send_date, db_path=db_path)
-    if attempted:
-        _log.warn("oneshot", f"[{conv_id}] Already recorded as '{status}' for today ({send_date}), skipping.")
-        return {"conv_id": conv_id, "status": "skipped", "reason": f"already_{status}"}
-
-    # Durable reservation BEFORE sending
+    ledger_requests.validate_settings(allow_repeat_same_day, max_sends_per_conversation_per_day,
+        max_sends_per_account_per_day=max_sends_per_account_per_day,
+        min_send_interval_seconds=min_send_interval_seconds,
+        max_sends_per_window=max_sends_per_window, window_seconds=window_seconds)
+    key = f"daily:{send_date}:{conv_id}" if idempotency_key is None else idempotency_key
+    payload = {"target": {"conv_id": conv_id, "conv_short_id": conv_short_id, "conv_type": conv_type},
+               "message": message_text}
+    if existing_request is None:
+        request, created = ledger_requests.create_request(
+            str(canonical_uid), conv_id, key, payload, db_path=db_path, client_msg_id=client_msg_id,
+            rotation_config=rotation_config)
+    else:
+        request = ledger_requests.get_request(existing_request, db_path=db_path)
+        if request['canonical_uid'] != str(canonical_uid) or request['conv_id'] != conv_id:
+            raise ledger.LedgerError('Request account/conversation does not match authenticated target')
+    snapshot_payload = json.loads(request['payload_json'])
+    message_text = snapshot_payload['message']
+    if snapshot_payload['target'] != payload['target']:
+        raise ledger.LedgerError('Request target metadata differs; refusing transmission')
+    client_msg_id = request['client_msg_id']
+    request_id = request['request_id']
+    if request['status'] != 'queued':
+        return {"conv_id": conv_id, "request_id": request_id, "status": "skipped",
+                "reason": f"already_{request['status']}", "existing_status": request['status'],
+                "server_msg_id": request['server_msg_id']}
+    if confirm_request is not None and not confirm_request(request):
+        return {"conv_id": conv_id, "request_id": request_id, "status": "skipped", "existing_status": "queued", "reason": "confirmation_declined"}
     try:
-        ledger.reserve_pending(canonical_uid, conv_id, client_msg_id, date=send_date, db_path=db_path)
-    except ledger.QuotaExceededError as e:
-        _log.warn("oneshot", f"[{conv_id}] Quota already claimed: {e}")
-        return {"conv_id": conv_id, "status": "skipped", "reason": "quota_claimed"}
+        packet, msg_type, _ = build_ws_packet(
+            conv_id=conv_id, short_id=conv_short_id, text=message_text,
+            device_id=device_id or config.DEVICE_ID, sdk_ms_token=config.MSG_SDK_MS_TOKEN,
+            tt_public_key=config.TT_PUBLIC_KEY, tt_client_data=config.TT_CLIENT_DATA,
+            conv_type=conv_type, client_id=client_msg_id,
+        )
+    except Exception:
+        ledger_requests.fail_pretransmit(request_id, db_path=db_path)
+        return {"conv_id": conv_id, "request_id": request_id, "status": "failed_pretransmit",
+                "reason": ledger.REASON_CLIENT_EXCEPTION}
+    try:
+        started = ledger_requests.start_transmission(
+            request_id, db_path=db_path,
+            allow_repeat_same_day=allow_repeat_same_day,
+            max_sends_per_conversation_per_day=max_sends_per_conversation_per_day,
+            max_sends_per_account_per_day=max_sends_per_account_per_day,
+            min_send_interval_seconds=min_send_interval_seconds,
+            max_sends_per_window=max_sends_per_window, window_seconds=window_seconds,
+            rotation_config=config_loader() if config_loader else rotation_config, session_name=session_name)
+        if not started:
+            stored = ledger_requests.get_request(request_id, db_path=db_path)
+            return {"conv_id": conv_id, "request_id": request_id, "status": "skipped",
+                    "existing_status": stored['status'], "server_msg_id": stored['server_msg_id'],
+                    "reason": "request_already_started"}
+    except breaker.CircuitOpen as exc:
+        return {"conv_id": conv_id, "request_id": request_id, "status": "skipped",
+                "existing_status": "queued", **exc.result()}
+    except ledger.QuotaExceededError as exc:
+        _log.warn("oneshot", str(exc))
+        return {"conv_id": conv_id, "request_id": request_id, "status": "skipped",
+                "existing_status": "queued",
+                "reason": "quota_claimed", "detail": str(exc),
+                **(exc.result() if isinstance(exc, ledger_requests.RateLimitError) else {})}
 
-    _log.info("oneshot", f"[{conv_id}] Reserved pending ({client_msg_id}). Transmitting packet...")
+    except ledger.LedgerError as exc:
+        return {"conv_id": conv_id, "request_id": request_id, "status": "skipped", "existing_status": "queued", "reason": "snapshot_held", "detail": str(exc)}
 
-    # Build verified packet
-    packet, msg_type, _ = build_ws_packet(
-        conv_id=conv_id,
-        short_id=conv_short_id,
-        text=message_text,
-        device_id=device_id or config.DEVICE_ID,
-        sdk_ms_token=config.MSG_SDK_MS_TOKEN,
-        tt_public_key=config.TT_PUBLIC_KEY,
-        tt_client_data=config.TT_CLIENT_DATA,
-        conv_type=conv_type,
-        client_id=client_msg_id,
-    )
-
+    send_date = ledger_requests.get_request(request_id, db_path=db_path)['date']
     start_monotonic = time.monotonic()
     deadline = start_monotonic + timeout_seconds
 
@@ -120,18 +168,24 @@ async def _send_target_oneshot(
     try:
         remaining_send = max(0.1, deadline - time.monotonic())
         await asyncio.wait_for(ws.send(packet), timeout=min(5.0, remaining_send))
-    except Exception:
+    except asyncio.CancelledError:
+        ledger.mark_failed_unknown(canonical_uid, conv_id, send_date, client_msg_id,
+            db_path=db_path, failure=breaker.Failure('UNKNOWN', 'send', 'cancelled'))
+        raise
+    except Exception as exc:
         _log.error("oneshot", f"[{conv_id}] WebSocket transmit failed ({ledger.REASON_WS_ERROR})")
         ledger.mark_failed_unknown(
             canonical_uid, conv_id, send_date, client_msg_id,
-            reason_code=ledger.REASON_WS_ERROR, db_path=db_path
+            reason_code=ledger.REASON_WS_ERROR, db_path=db_path,
+            failure=breaker.classify(exc, "send")
         )
-        return {"conv_id": conv_id, "status": ledger.STATUS_FAILED_UNKNOWN, "reason": ledger.REASON_WS_ERROR}
+        return {"conv_id": conv_id, "request_id": request_id, "status": ledger.STATUS_FAILED_UNKNOWN, "reason": ledger.REASON_WS_ERROR}
 
     # Wait for correlated server echo with finite monotonic timeout
     confirmed = False
     server_msg_id = None
     failure_reason = ledger.REASON_CORRELATION_TIMEOUT
+    failure = breaker.Failure("UNKNOWN", "echo", "deadline")
 
     try:
         while time.monotonic() < deadline:
@@ -144,26 +198,7 @@ async def _send_target_oneshot(
             if not isinstance(raw, bytes):
                 continue
 
-            decompressed = LttkClient._decompress_lz4_frame(raw)
-            frames_to_check = [raw]
-            if decompressed:
-                frames_to_check.append(decompressed)
-
-            # Check for ban / restriction / error indications in both raw and decompressed frames
-            is_banned_or_error = False
-            for f in frames_to_check:
-                if (b'sending_ban' in f or b'"ban"' in f or b'restricted' in f
-                        or b'restriction' in f or (b'"status_code":' in f and b'"status_code":0' not in f)
-                        or b'"error"' in f or b'error_code' in f):
-                    is_banned_or_error = True
-                    break
-
-            if is_banned_or_error:
-                _log.error("oneshot", f"[{conv_id}] Server returned restriction or error frame ({ledger.REASON_WS_ERROR})")
-                failure_reason = ledger.REASON_WS_ERROR
-                break
-
-            candidates = LttkClient.find_all_msgbodies(decompressed or raw)
+            candidates = LttkClient.decode_echo_frame(raw)
             for cand in candidates:
                 is_match, reason, sid = LttkClient.check_echo_correlation(
                     cand,
@@ -180,7 +215,12 @@ async def _send_target_oneshot(
             if confirmed:
                 break
 
-    except Exception:
+    except asyncio.CancelledError:
+        ledger.mark_failed_unknown(canonical_uid, conv_id, send_date, client_msg_id,
+            db_path=db_path, failure=breaker.Failure('UNKNOWN', 'echo', 'cancelled'))
+        raise
+    except Exception as exc:
+        failure = breaker.classify(exc, "echo") or breaker.Failure("UNKNOWN", "echo", "client")
         _log.error("oneshot", f"[{conv_id}] Exception while awaiting server echo ({ledger.REASON_CLIENT_EXCEPTION})")
         failure_reason = ledger.REASON_CLIENT_EXCEPTION
 
@@ -191,14 +231,14 @@ async def _send_target_oneshot(
             server_msg_id, confirm_date=confirm_date, db_path=db_path
         )
         _log.ok("oneshot", f"[{conv_id}] Confirmed server echo received: server_msg_id={server_msg_id}")
-        return {"conv_id": conv_id, "status": ledger.STATUS_CONFIRMED, "server_msg_id": server_msg_id}
+        return {"conv_id": conv_id, "request_id": request_id, "status": ledger.STATUS_CONFIRMED, "server_msg_id": server_msg_id}
     else:
-        _log.warn("oneshot", f"[{conv_id}] Send unconfirmed; recorded as failed_unknown ({failure_reason}). No retries today.")
+        _log.warn("oneshot", f"[{conv_id}] Send unconfirmed; recorded as failed_unknown ({failure_reason}). Blocked until Owner review, including future days.")
         ledger.mark_failed_unknown(
             canonical_uid, conv_id, send_date, client_msg_id,
-            reason_code=failure_reason, db_path=db_path
+            reason_code=failure_reason, db_path=db_path, failure=failure
         )
-        return {"conv_id": conv_id, "status": ledger.STATUS_FAILED_UNKNOWN, "reason": failure_reason}
+        return {"conv_id": conv_id, "request_id": request_id, "status": ledger.STATUS_FAILED_UNKNOWN, "reason": failure_reason}
 
 
 _RE_TIKTOK_WS_HOST = re.compile(r"^im-ws(?:-[a-z0-9]+)?\.tiktok\.com$")
@@ -285,8 +325,18 @@ async def run_oneshot_send(
     timeout_seconds: float = 20.0,
     validate_server: bool = True,
     db_path: str = ledger._DEFAULT_LEDGER_PATH,
+    *, idempotency_key: str | None = None,
+    allow_repeat_same_day: bool | None = None,
+    max_sends_per_conversation_per_day: int | None = None,
+    max_sends_per_account_per_day: int | None = None,
+    min_send_interval_seconds: int | None = None,
+    max_sends_per_window: int | None = None,
+    window_seconds: int | None = None,
+    request_id: str | None = None,
+    confirm_request=None,
 ) -> dict:
     """Execute one-shot streak transmission workflow."""
+    ledger.check_ready(db_path)
     if not os.path.exists(config_path):
         raise FileNotFoundError(f"Configuration file not found: {config_path}")
 
@@ -300,58 +350,103 @@ async def run_oneshot_send(
     if not valid:
         raise ValueError(f"Configuration validation failed: {err}")
 
+    repeat = cfg.get("allow_repeat_same_day", False) if allow_repeat_same_day is None else allow_repeat_same_day
+    limit = cfg.get("max_sends_per_conversation_per_day", 1) if max_sends_per_conversation_per_day is None else max_sends_per_conversation_per_day
+    settings = ledger_requests.settings_from_config(cfg)
+    overrides = dict(allow_repeat_same_day=repeat, max_sends_per_conversation_per_day=limit,
+                     max_sends_per_account_per_day=max_sends_per_account_per_day,
+                     min_send_interval_seconds=min_send_interval_seconds,
+                     max_sends_per_window=max_sends_per_window, window_seconds=window_seconds)
+    settings.update({key: value for key, value in overrides.items() if value is not None})
+    settings = ledger_requests.validate_settings(**settings)
+    if idempotency_key is not None and (not isinstance(idempotency_key, str) or not idempotency_key.strip()):
+        raise ValueError("Idempotency key must be a nonempty string")
     session_name = cfg["session"]
-    message_text = cfg["message"]
+    message_text = cfg.get("message", "")
+    def reload_config():
+        with open(config_path, encoding="utf-8-sig") as stream:
+            return json.load(stream)
 
-    cookies = load_session(session_name)
-    if not cookies or not cookies.get("sessionid"):
-        raise ValueError(
-            f"Session '{session_name}' not found or missing sessionid cookie. "
-            f"Please run 'python main.py login' first."
-        )
-
-    canonical_uid = get_own_user_id(cookies=cookies)
-    if not canonical_uid:
-        raise RuntimeError("Failed to resolve canonical own user ID from server. Session may be expired.")
-
-    _log.info("oneshot", f"Authenticated canonical UID: {canonical_uid}")
-
-    _log.info("oneshot", f"Authenticated canonical UID: {canonical_uid}")
-
-    # Extract device_id bound to this WS auth if available
-    ws_auth = load_ws_auth(session_name=session_name, cookies=cookies)
-    effective_device_id = ws_auth.get("device_id") if ws_auth else config.DEVICE_ID
-
-    if validate_server:
-        validate_against_server_inbox(cookies, targets, device_id=effective_device_id)
-
-    # Acquire process run lock
-    with ledger.RunLock():
-        results = []
-        connection = await _open_ws(*_prepare_ws(cookies, session_name, ws_auth))
-        async with connection as ws:
-            _log.ok("oneshot", "Connected to WebSocket. Processing targets sequentially...")
-            # Handshake ping
-            await asyncio.wait_for(ws.send("hi"), timeout=5.0)
-            try:
-                await asyncio.wait_for(ws.recv(), timeout=5.0)
-            except asyncio.TimeoutError:
-                pass
-
-            for target in targets:
-                res = await _send_target_oneshot(
-                    ws=ws,
-                    canonical_uid=canonical_uid,
-                    target=target,
-                    message_text=message_text,
-                    timeout_seconds=timeout_seconds,
-                    db_path=db_path,
-                    device_id=effective_device_id,
+    with ledger.RunLock(os.path.join(os.path.dirname(os.path.abspath(db_path)), 'run.lock')) as run_lock:
+        ledger_requests.recover_pending(db_path=db_path, run_lock=run_lock)
+        breaker.gate(db_path=db_path, session=session_name)
+        canonical_uid = None
+        stage = 'local'
+        try:
+            cookies = load_session(session_name)
+            if not cookies or not cookies.get("sessionid"):
+                raise ValueError(
+                    f"Session '{session_name}' not found or missing sessionid cookie. "
+                    f"Please run 'python main.py login' first."
                 )
-                results.append(res)
 
-        return {
-            "canonical_uid": canonical_uid,
-            "date": ledger.get_current_ho_chi_minh_date(),
-            "results": results,
-        }
+            stage = "identity"
+            canonical_uid = get_own_user_id(cookies=cookies, use_cache=False)
+            if not canonical_uid:
+                raise breaker.ProtocolFailure("Identity evidence missing")
+            breaker.bind_session(canonical_uid, session_name, db_path=db_path)
+            breaker.gate(db_path=db_path, uid=canonical_uid, session=session_name)
+
+            _log.info("oneshot", f"Authenticated canonical UID: {canonical_uid}")
+
+            stage = "local"
+            # Extract device_id bound to this WS auth if available
+            ws_auth = load_ws_auth(session_name=session_name, cookies=cookies)
+            effective_device_id = ws_auth.get("device_id") if ws_auth else config.DEVICE_ID
+
+            stage = "inbox"
+            if validate_server:
+                validate_against_server_inbox(cookies, targets, device_id=effective_device_id)
+
+            if request_id:
+                stored = ledger_requests.get_request(request_id, db_path=db_path)
+                if idempotency_key is not None and idempotency_key != stored['idempotency_key']:
+                    raise ledger.LedgerError('Resume requires the exact stored idempotency key')
+                targets = [t for t in targets if t['conv_id'] == stored['conv_id']]
+                if len(targets) != 1 or stored['canonical_uid'] != str(canonical_uid):
+                    raise ledger.LedgerError('Request does not match configured account and target')
+
+            results = []
+            stage = "handshake"
+            prepared_ws = _prepare_ws(cookies, session_name, ws_auth)
+            connection = await _open_ws(*prepared_ws)
+            async with connection as ws:
+                _log.ok("oneshot", "Connected to WebSocket. Processing targets sequentially...")
+                # Handshake ping
+                await asyncio.wait_for(ws.send("hi"), timeout=5.0)
+                try:
+                    await asyncio.wait_for(ws.recv(), timeout=5.0)
+                except asyncio.TimeoutError:
+                    pass
+
+                for target in targets:
+                    res = await _send_target_oneshot(
+                        ws=ws,
+                        canonical_uid=canonical_uid,
+                        target=target,
+                        message_text=message_text,
+                        timeout_seconds=timeout_seconds,
+                        db_path=db_path,
+                        device_id=effective_device_id,
+                        idempotency_key=(json.dumps([idempotency_key, target["conv_id"]]) if idempotency_key else None),
+                        rotation_config=cfg if "rotation" in cfg else None,
+                        session_name=session_name, existing_request=request_id, config_loader=reload_config, confirm_request=confirm_request,
+                        **settings,
+                    )
+                    results.append(res)
+                    if res.get('status') == 'failed_unknown' or res.get('reason') == 'CIRCUIT_OPEN':
+                        results.extend({'conv_id': t['conv_id'], 'status': 'not_attempted', 'reason': 'CIRCUIT_OPEN'}
+                                       for t in targets[len(results):])
+                        break
+
+            return {
+                "canonical_uid": canonical_uid,
+                "date": ledger.get_current_ho_chi_minh_date(),
+                "results": results,
+            }
+        except Exception as exc:
+            failure = breaker.classify(exc, stage) if stage != "local" else None
+            if failure is not None:
+                breaker.record_failure(failure, db_path=db_path, uid=canonical_uid, session=session_name)
+                raise breaker.CircuitOpen(breaker.inspect(db_path=db_path, uid=canonical_uid, session=session_name)) from None
+            raise

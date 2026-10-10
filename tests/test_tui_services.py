@@ -6,7 +6,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from tui_services import (
+from services import (
     Conversation, TIME_PATTERN, SESSION_PATTERN, atomic_write_json,
     list_sessions, matching_selected_ids, parse_inbox, read_json_object,
     save_plan, save_preferences, valid_session_name,

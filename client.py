@@ -1027,6 +1027,17 @@ class LttkClient:
         }
 
     @staticmethod
+    def decode_echo_frame(raw):
+        """Only known compression/message containers; no guessed error codes."""
+        if not isinstance(raw, bytes):
+            return []
+        candidates = LttkClient.find_all_msgbodies(raw)
+        if candidates:
+            return candidates
+        decoded = LttkClient._decompress_lz4_frame(raw)
+        return LttkClient.find_all_msgbodies(decoded) if decoded else []
+
+    @staticmethod
     def find_all_msgbodies(raw: bytes, depth: int = 0) -> list[dict]:
         if depth > 8 or not raw or not isinstance(raw, (bytes, bytearray)):
             return []

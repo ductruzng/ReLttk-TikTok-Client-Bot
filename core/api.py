@@ -20,18 +20,19 @@ def _cookie_str(cookies: dict) -> str:
     return "; ".join(f"{k}={v}" for k, v in cookies.items())
 
 
-def get_own_user_id(cookies: dict | None = None) -> str:
+def get_own_user_id(cookies: dict | None = None, *, use_cache=True) -> str:
     cookies = cookies or config.COOKIES
     session = cookies.get("sessionid", "")
     current_hash = hashlib.sha256(session.encode()).hexdigest()[:16]
 
-    try:
-        with open(_UID_CACHE_FILE) as f:
-            cache = json.load(f)
-        if cache.get("session_hash") == current_hash:
-            return cache["uid"]
-    except (FileNotFoundError, KeyError, json.JSONDecodeError):
-        pass
+    if use_cache:
+        try:
+            with open(_UID_CACHE_FILE) as f:
+                cache = json.load(f)
+            if cache.get("session_hash") == current_hash:
+                return cache["uid"]
+        except (FileNotFoundError, KeyError, json.JSONDecodeError):
+            pass
 
     req = urllib.request.Request(
         "https://www.tiktok.com/messages?lang=es-419",
@@ -47,11 +48,13 @@ def get_own_user_id(cookies: dict | None = None) -> str:
 
     m = re.search(r'"odinId"\s*:\s*"(\d+)"', html)
     if not m:
-        raise RuntimeError("No se pudo obtener OWN_USER_ID desde la pagina de mensajes")
+        from circuit_breaker import ProtocolFailure
+        raise ProtocolFailure("Identity evidence missing")
 
     uid = m.group(1)
-    with open(_UID_CACHE_FILE, "w") as f:
-        json.dump({"session_hash": current_hash, "uid": uid}, f)
+    if use_cache:
+        with open(_UID_CACHE_FILE, "w") as f:
+            json.dump({"session_hash": current_hash, "uid": uid}, f)
 
     return uid
 

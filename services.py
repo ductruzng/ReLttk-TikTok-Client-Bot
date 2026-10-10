@@ -1,7 +1,7 @@
 """Safe, testable service layer for TikTok Streak Manager TUI v0.2.
 
-Does NOT transmit messages, start a scheduler, or read WS credentials.
-Network access only occurs when fetch_inbox() is explicitly called.
+Network access occurs only through explicit fetch_inbox() or send_plan() calls.
+Importing this module performs no network or runtime-data access.
 """
 
 from __future__ import annotations
@@ -118,7 +118,7 @@ def parse_inbox(raw: object) -> list[Conversation]:
         seen.add(conv_id)
         name = item.get("name")
         if not isinstance(name, str) or not name.strip():
-            name = "(Chưa có tên)"
+            name = "(ChÃƒâ€ Ã‚Â°a cÃƒÆ’Ã‚Â³ tÃƒÆ’Ã‚Âªn)"
         name = " ".join(name.split())[:100]
         output.append(Conversation(conv_id, short_id, conv_type, name))
     return output
@@ -166,6 +166,7 @@ def save_plan(
     message: str,
     recipients: list[Conversation],
     path: Path = CONFIG_PATH,
+    *, allow_repeat_same_day: bool | None = None,
 ) -> dict[str, Any]:
     if not valid_session_name(session):
         raise ValueError("Invalid session name")
@@ -176,11 +177,18 @@ def save_plan(
     if len({c.conv_id for c in recipients}) != len(recipients):
         raise ValueError("Duplicate conversation detected")
     current = read_json_object(path)
+    if 'rotation' in current:
+        raise ValueError('Rotation plan is managed through CLI/config; TUI cannot overwrite templates')
     current.update({
         "session": session,
         "message": message.strip(),
         "targets": [c.target() for c in recipients],
     })
+    if allow_repeat_same_day is not None:
+        current["allow_repeat_same_day"] = allow_repeat_same_day
+    from ledger_requests import DEFAULT_SETTINGS
+    for name, default in DEFAULT_SETTINGS.items():
+        current.setdefault(name, default)
     from main import validate_config
     valid, errors, _ = validate_config(current)
     if not valid:
@@ -224,3 +232,86 @@ def summarize_results(result: dict) -> tuple[int, int, int]:
     confirmed = sum(r.get("status") == "confirmed" for r in rows)
     skipped = sum(r.get("status") == "skipped" for r in rows)
     return confirmed, skipped, len(rows) - confirmed - skipped
+
+
+def send_result_completed(row: dict) -> bool:
+    """A skipped operation is complete only when its durable request is confirmed."""
+    return row.get('status') == 'confirmed' or (
+        row.get('status') == 'skipped' and row.get('existing_status') == 'confirmed')
+
+
+def save_fixed_message(message: str, path=CONFIG_PATH):
+    import rotation
+    from ledger_requests import settings_from_config
+    cfg = read_json_object(Path(path))
+    if 'rotation' in cfg:
+        raise ValueError('Plan uses rotation; edit rotation.templates in the configuration instead')
+    cfg['message'] = message
+    rotation.catalog(cfg)
+    settings_from_config(cfg)
+    atomic_write_json(Path(path), cfg)
+    return cfg
+
+
+async def send_plan(config_path=CONFIG_PATH, *, idempotency_key=None, **options):
+    """Shared CLI/TUI send entry. Repeat policy comes from the plan, never deletion."""
+    from oneshot import run_oneshot_send
+    return await run_oneshot_send(config_path=str(config_path), idempotency_key=idempotency_key, **options)
+
+
+def request_preview(request_id, *, db_path, config_path=None):
+    import ledger
+    import ledger_requests as requests
+    ledger.check_ready(db_path)
+    row = requests.get_request(request_id, db_path=db_path)
+    preview = {'request': row, 'payload': json.loads(row['payload_json'])}
+    if row['campaign_id'] is not None and config_path:
+        import rotation
+        cfg = read_json_object(Path(config_path))
+        preview['review'] = requests.snapshot_review(row, cfg)
+        preview['current_catalog'] = rotation.catalog(cfg)
+        preview['configuration_changed'] = (preview['review']['config_fingerprint'] !=
+                                            json.loads(row['snapshot_json'])['fingerprint'])
+    return preview
+
+
+def cancel_request(request_id, reason, *, db_path):
+    from ledger_requests import cancel_request as cancel
+    return cancel(request_id, reason, db_path=db_path)
+
+
+def approve_request_snapshot(request_id, preview, reason, *, db_path, config_path):
+    from ledger_requests import approve_snapshot
+    return approve_snapshot(request_id, read_json_object(Path(config_path)), preview['review'], reason, db_path=db_path)
+
+
+def rotation_skip_preview(scope, *, db_path):
+    from ledger_requests import preview_skip
+    return preview_skip(scope, db_path=db_path)
+
+
+def rotation_skip(scope, preview, reason, *, db_path):
+    from ledger_requests import skip_selection
+    return skip_selection(scope, preview, reason, db_path=db_path)
+
+
+def save_send_settings(allow_repeat_same_day, max_sends_per_conversation_per_day, path=CONFIG_PATH, **limits):
+    from ledger_requests import settings_from_config, DEFAULT_SETTINGS
+    if set(limits) - DEFAULT_SETTINGS.keys():
+        raise ValueError("Unknown rate-limit setting")
+    cfg = read_json_object(path)
+    cfg.update(allow_repeat_same_day=allow_repeat_same_day,
+               max_sends_per_conversation_per_day=max_sends_per_conversation_per_day, **limits)
+    cfg.update(settings_from_config(cfg))
+    atomic_write_json(path, cfg)
+    return cfg
+
+
+def breaker_status(*, db_path, account=None, session=None, history=False):
+    import circuit_breaker
+    return circuit_breaker.inspect(db_path=db_path, uid=account, session=session, history=history)
+
+
+def breaker_reset(scope_type, scope_key, preview, reason, *, db_path):
+    import circuit_breaker
+    return circuit_breaker.reset(scope_type, scope_key, preview, reason, db_path=db_path)

@@ -20,7 +20,7 @@ from textual.widgets import (
     Select, Static, Switch,
 )
 
-from tui_services import (
+from services import (
     CONFIG_PATH, PREFS_PATH, ROOT, Conversation,
     fetch_inbox, list_sessions, matching_selected_ids,
     read_json_object, save_plan, save_preferences,
@@ -341,7 +341,7 @@ class TikTokTUI(App):
     def _check_schedule(self) -> None:
         from datetime import datetime
         from zoneinfo import ZoneInfo
-        from tui_services import scheduled_run_key
+        from services import scheduled_run_key
         try:
             prefs = read_json_object(PREFS_PATH)
             key = scheduled_run_key(
@@ -383,7 +383,7 @@ class TikTokTUI(App):
                 prefs = read_json_object(PREFS_PATH)
                 self.query_one("#send-time", Input).value = str(prefs.get("time", "08:00"))
                 self.query_one("#enable-schedule", Switch).value = bool(prefs.get("enabled", False))
-                self.query_one("#skip-sent", Switch).value = bool(prefs.get("skip_if_sent", True))
+                self.query_one("#skip-sent", Switch).value = not bool(read_json_object(CONFIG_PATH).get("allow_repeat_same_day", False))
             self._update_summary()
             if not initial:
                 self.notify(f"Tìm thấy {len(names)} tài khoản đã lưu")
@@ -521,7 +521,7 @@ class TikTokTUI(App):
         skip_if_sent = self.query_one("#skip-sent", Switch).value
 
         try:
-            save_plan(session, message, chosen)
+            save_plan(session, message, chosen, allow_repeat_same_day=not skip_if_sent)
             save_preferences(send_time, enabled, skip_if_sent=skip_if_sent)
             status = "BẬT" if enabled else "TẮT"
             self._activity(f"💾 ĐÃ LƯU: {len(chosen)} người nhận | Giờ gửi: {send_time} | Scheduler: {status}")
@@ -579,35 +579,18 @@ class TikTokTUI(App):
     @work(thread=True, group="send")
     def _run_send(self, source: str) -> None:
         import oneshot
-        from tui_services import summarize_results
+        from services import summarize_results
         try:
-            prefs = read_json_object(PREFS_PATH)
-            skip_if_sent = prefs.get("skip_if_sent", True)
-
-            # If user wants to force-resend today, clean today's ledger records for these targets
-            if not skip_if_sent and CONFIG_PATH.exists():
-                cfg = read_json_object(CONFIG_PATH)
-                targets = cfg.get("targets", [])
-                session_name = cfg.get("session")
-                if session_name and targets:
-                    from qrlogin import load_session
-                    from core.api import get_own_user_id
-                    cookies = load_session(session_name)
-                    canonical_uid = get_own_user_id(cookies)
-                    if canonical_uid:
-                        import ledger
-                        conn = ledger._get_readwrite_connection()
-                        cur = conn.cursor()
-                        today = ledger.get_current_ho_chi_minh_date()
-                        for t in targets:
-                            cur.execute(
-                                "DELETE FROM daily_ledger WHERE canonical_uid = ? AND conv_id = ? AND date = ?",
-                                (str(canonical_uid), str(t.get("conv_id")), str(today))
-                            )
-                        conn.commit()
-                        conn.close()
-
-            result = asyncio.run(oneshot.run_oneshot_send(config_path=str(CONFIG_PATH)))
+            from services import send_plan
+            import uuid
+            # Existing scheduled task keeps a stable key; manual actions get new IDs.
+            key = ("scheduled:" + self._last_run_time) if source == "Scheduler" else "manual:" + str(uuid.uuid4())
+            def preview_only(row):
+                self.call_from_thread(self._activity, f"Preview request={row['request_id']}: {row['payload_json']}")
+                self.call_from_thread(self._activity, "Request held. Use CLI --send --request-id with this request's stored idempotency key to review and confirm.")
+                return False
+            result = asyncio.run(send_plan(CONFIG_PATH, idempotency_key=key,
+                confirm_request=preview_only if source != "Scheduler" else None))
             confirmed, skipped, failed = summarize_results(result)
             text = (f"[{source}] ✅ Kết quả: {confirmed} xác nhận thành công | {skipped} bỏ qua | {failed} thất bại.")
             self.call_from_thread(self._activity, text)
@@ -616,7 +599,7 @@ class TikTokTUI(App):
                 cid = r.get('conv_id', '')
                 st = r.get('status', '')
                 rs = r.get('reason', '')
-                self.call_from_thread(self._activity, f"   ↳ {cid}: {st} {rs}")
+                self.call_from_thread(self._activity, f"   ↳ {cid}: {st} {r.get('detail') or rs} | request={r.get('request_id', '')}")
         except Exception as exc:
             text = f"[{source}] ❌ Quá trình gửi gặp lỗi: {type(exc).__name__}."
             self.call_from_thread(self._activity, text)

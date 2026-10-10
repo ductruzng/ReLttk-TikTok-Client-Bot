@@ -52,9 +52,17 @@ def validate_config(cfg: object) -> Tuple[bool, list[str], list[dict]]:
         if "/" in session_str or "\\" in session_str or ".." in session_str or "\0" in session_str or not re.match(r'^[a-zA-Z0-9_\.-]+$', session_str):
             errors.append(f"Field 'session' has unsafe name {session_str!r}. Path traversal characters are disallowed.")
 
-    message = cfg.get("message")
-    if not message or not isinstance(message, str) or not message.strip():
-        errors.append("Field 'message' must be a non-empty string.")
+    import rotation
+    try:
+        rotation.catalog(cfg)
+    except (ValueError, UnicodeError) as exc:
+        errors.append(str(exc))
+
+    from ledger_requests import settings_from_config
+    try:
+        settings_from_config(cfg)
+    except ValueError as exc:
+        errors.append(str(exc))
 
     raw_targets = cfg.get("targets")
     if raw_targets is None or not isinstance(raw_targets, list):
@@ -182,6 +190,9 @@ def cmd_dry_run(config_path: str = DEFAULT_CONFIG_FILE) -> int:
         print("       Edit streak.json to correct these fields before sending.")
         return 1
 
+    if "rotation" in cfg:
+        print(json.dumps(cfg['rotation'], ensure_ascii=True, indent=2))
+        print("Rotation preview: selection requires ledger state; no choice or state change made.")
     print(f" Planned Targets ({len(targets)} total):")
     for idx, t in enumerate(targets, 1):
         type_label = "Direct (1)" if t["conv_type"] == 1 else "Group (2)"
@@ -202,20 +213,26 @@ def cmd_dry_run(config_path: str = DEFAULT_CONFIG_FILE) -> int:
     return 0
 
 
-def cmd_send(config_path: str = DEFAULT_CONFIG_FILE) -> int:
+def cmd_send(config_path: str = DEFAULT_CONFIG_FILE, idempotency_key: str | None = None, db_path: str | None = None,
+             *, request_id=None, confirm_request=None) -> int:
     """Execute one-shot live transmission with explicit opt-in."""
     print("=" * 64)
     print(" ReLttk Daily Streak Bot - Executing One-Shot Send")
     print("=" * 64)
 
     try:
-        import oneshot
+        import ledger
         import asyncio
-        result = asyncio.run(oneshot.run_oneshot_send(config_path=config_path))
+        from services import send_plan, send_result_completed
+        options = {"db_path": db_path} if db_path is not None else {}
+        if request_id:
+            options['request_id'] = request_id
+        if confirm_request:
+            options['confirm_request'] = confirm_request
+        result = asyncio.run(send_plan(config_path, idempotency_key=idempotency_key, **options))
         print("\nTransmission Summary:")
         print(f" Canonical UID: {result.get('canonical_uid')}")
         print(f" Date:          {result.get('date')}")
-        has_failure = False
         results_list = result.get("results", [])
         for r in results_list:
             st = r.get("status")
@@ -223,16 +240,19 @@ def cmd_send(config_path: str = DEFAULT_CONFIG_FILE) -> int:
             if st == "confirmed":
                 print(f"  [+] {cid}: CONFIRMED (Server Msg ID: {r.get('server_msg_id')})")
             elif st == "skipped":
-                print(f"  [-] {cid}: SKIPPED ({r.get('reason')})")
+                stored = r.get('existing_status', 'unspecified')
+                print(f"  [-] {cid}: SKIPPED; request={stored.upper()} ({r.get('detail') or r.get('reason')})")
             else:
-                has_failure = True
-                print(f"  [x] {cid}: FAILED_UNKNOWN ({r.get('reason')})")
-        if has_failure or not results_list:
+                label = st.upper() if isinstance(st, str) else 'INVALID_RESULT'
+                print(f"  [x] {cid}: {label} ({r.get('detail') or r.get('reason')})")
+        if not results_list or not all(send_result_completed(r) for r in results_list):
             return 1
         return 0
     except Exception as e:
         if not _report_ws_rejection(e):
             print(f"\n[!] Send execution failed: {type(e).__name__}")
+            if isinstance(e, ledger.LedgerError):
+                print(str(e))
         return 1
 
 
@@ -346,22 +366,27 @@ def cmd_list_conversations(session_name: str) -> int:
         return 1
 
 
-def cmd_status(config_path: str = DEFAULT_CONFIG_FILE) -> int:
+def cmd_status(config_path: str = DEFAULT_CONFIG_FILE, db_path: str | None = None) -> int:
     """Readonly inspection of the SQLite ledger."""
     today = get_ho_chi_minh_date()
     print(f"Ledger Status for {today} (Asia/Ho_Chi_Minh):")
     try:
         import ledger
-        if not os.path.exists(ledger._DEFAULT_LEDGER_PATH):
+        db_path = db_path or ledger._DEFAULT_LEDGER_PATH
+        if not os.path.exists(db_path):
             print("  Ledger database file does not exist yet (clean state).")
             return 0
 
-        conn = ledger._get_readonly_connection()
+        conn = ledger._get_readonly_connection(db_path)
         if conn is None:
             print("  Ledger database file not accessible.")
             return 0
         try:
             cur = conn.cursor()
+            if conn.execute("PRAGMA user_version").fetchone()[0] in (2, 3, 4, 5):
+                for row in conn.execute("SELECT request_id,date,status,conv_id,transmitted FROM send_requests ORDER BY created_at DESC LIMIT 20"):
+                    print(f"  Request {row[0]} | {row[1] or '-'} | {row[2]} | {row[3]} | transmitted={row[4]}")
+                return 0
             cur.execute(
                 "SELECT canonical_uid, conv_id, date, status, attempt_time, server_msg_id, reason_code "
                 "FROM daily_ledger ORDER BY date DESC, attempt_time DESC LIMIT 20"
@@ -382,6 +407,93 @@ def cmd_status(config_path: str = DEFAULT_CONFIG_FILE) -> int:
         return 1
 
 
+def cmd_ledger_admin(command, db_path):
+    import ledger_migrations
+    try:
+        if command == "ledger-initialize":
+            ledger_migrations.initialize(db_path)
+            print("Initialized schema V5. No TikTok access.")
+            return 0
+        report = ledger_migrations.preflight(db_path)
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        if report['errors']:
+            return 1
+        if command == "ledger-migrate":
+            backup = ledger_migrations.migrate(db_path)
+            print(f"Schema V5 ready. Backup: {backup or 'unchanged (already V5)'}")
+        return 0
+    except Exception as exc:
+        print(f"Ledger administration failed: {type(exc).__name__}: {exc}")
+        return 1
+
+
+def confirm_snapshot(row):
+    print('Request:', row['request_id'])
+    print('Exact payload:', row['payload_json'])
+    if row['snapshot_json']:
+        print('Rotation snapshot:', row['snapshot_json'])
+    return input('Type SEND to transmit this request: ') == 'SEND'
+
+
+def cmd_request_admin(args):
+    import services
+    import ledger
+    try:
+        if args.command == 'rotation-skip-selection':
+            if not (sys.stdin.isatty() and sys.stdout.isatty()):
+                raise ValueError('Selection skip requires an interactive terminal; --yes is insufficient')
+            scope = (args.account, args.conversation, args.campaign)
+            preview = services.rotation_skip_preview(scope, db_path=args.db)
+        else:
+            preview = services.request_preview(args.request_id, db_path=args.db,
+                config_path=args.config if args.command == 'request-approve-snapshot' else None)
+        print(json.dumps(preview, ensure_ascii=True, indent=2))
+        if args.command == 'request-show':
+            return 0
+        if not (sys.stdin.isatty() and sys.stdout.isatty()):
+            raise ValueError('This administration command requires interactive preview and confirmation')
+        reason = input('Required reason: ')
+        if input(f'Type {args.command} to confirm: ') != args.command:
+            print('No changes made.')
+            return 1
+        if args.command == 'rotation-skip-selection':
+            services.rotation_skip(scope, preview, reason, db_path=args.db)
+        elif args.command == 'request-cancel':
+            services.cancel_request(args.request_id, reason, db_path=args.db)
+        else:
+            services.approve_request_snapshot(args.request_id, preview, reason, db_path=args.db, config_path=args.config)
+        print('Recorded. No message sent.')
+        return 0
+    except (ValueError, RuntimeError, ledger.LedgerError) as exc:
+        print(f'Administration blocked: {exc}')
+        return 1
+
+
+def cmd_breaker_admin(args):
+    import ledger
+    import services
+    try:
+        rows = services.breaker_status(db_path=args.db, account=args.account, session=args.session,
+                                       history=args.command == 'breaker-history')
+        print(json.dumps(rows, ensure_ascii=True, indent=2))
+        if args.command != 'breaker-reset':
+            return 0
+        if not (sys.stdin.isatty() and sys.stdout.isatty()):
+            raise ValueError('Reset requires interactive preview and separate confirmation')
+        if len(rows) != 1:
+            raise ValueError('Select exactly one existing circuit to reset')
+        reason = input('Required reason (do not enter credentials): ')
+        if input('Type RESET to confirm: ') != 'RESET':
+            return 1
+        row = rows[0]
+        services.breaker_reset(row['scope_type'], row['scope_key'], row, reason, db_path=args.db)
+        print('Reset recorded. Other scope barriers remain. No message sent.')
+        return 0
+    except (ValueError, ledger.LedgerError) as exc:
+        print(f'Breaker administration blocked: {exc}')
+        return 1
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="ReLttk Daily Streak Bot - Safe One-Shot CLI",
@@ -393,6 +505,10 @@ def main() -> int:
         help="Path to JSON configuration file (default: streak.json)",
     )
 
+    parser.add_argument("--db", help="Existing ledger path for send/status; never created by sending")
+    parser.add_argument("--idempotency-key", help="Stable task key; reuse for the same task, new key for intentional repeat")
+    parser.add_argument('--yes', action='store_true', help='Noninteractive send consent; never approves changed snapshots or selection skip')
+    parser.add_argument('--request-id', help='Resume this existing request without selecting a new template')
     mode_group = parser.add_mutually_exclusive_group()
     mode_group.add_argument(
         "--send",
@@ -406,6 +522,27 @@ def main() -> int:
     )
 
     subparsers = parser.add_subparsers(dest="command", help="Additional commands")
+    for command in ('request-show', 'request-cancel', 'request-approve-snapshot', 'rotation-skip-selection'):
+        admin = subparsers.add_parser(command, help='Explicit request/rotation administration; no TikTok access')
+        admin.add_argument('--db', required=True)
+        if command == 'rotation-skip-selection':
+            for field in ('account', 'conversation', 'campaign'):
+                admin.add_argument('--' + field, required=True)
+        else:
+            admin.add_argument('--request-id', required=True)
+        if command == 'request-approve-snapshot':
+            admin.add_argument('--config', required=True)
+
+    for command in ('breaker-status', 'breaker-history', 'breaker-reset'):
+        admin = subparsers.add_parser(command, help='Offline circuit administration')
+        admin.add_argument('--db', required=True)
+        scope = admin.add_mutually_exclusive_group(required=True)
+        scope.add_argument('--account')
+        scope.add_argument('--session')
+
+    for command in ("ledger-preflight", "ledger-initialize", "ledger-migrate"):
+        admin = subparsers.add_parser(command, help="Explicit offline ledger administration")
+        admin.add_argument("--db", required=True, help="Exact database path (no implicit default)")
 
     subparsers.add_parser("login", help="Interactive QR login to save a session")
 
@@ -438,12 +575,18 @@ def main() -> int:
     if args.command is not None and (args.send or args.dry_run):
         parser.error("Mode flags (--send, --dry-run) cannot be combined with subcommands.")
 
+    if args.command in ('breaker-status', 'breaker-history', 'breaker-reset'):
+        return cmd_breaker_admin(args)
+    if args.command in ("ledger-preflight", "ledger-initialize", "ledger-migrate"):
+        return cmd_ledger_admin(args.command, args.db)
+    if args.command in ('request-show', 'request-cancel', 'request-approve-snapshot', 'rotation-skip-selection'):
+        return cmd_request_admin(args)
     if args.command == "login":
         return cmd_login()
     elif args.command == "list-conversations":
         return cmd_list_conversations(session_name=args.session)
     elif args.command == "status":
-        return cmd_status(config_path=args.config)
+        return cmd_status(config_path=args.config, db_path=args.db)
     elif args.command == "ws-probe":
         return cmd_ws_probe(session_name=args.session, host=args.host)
     elif args.command == "tui":
@@ -458,7 +601,12 @@ def main() -> int:
         return cmd_capture_ws_auth(args.session)
 
     if args.send:
-        return cmd_send(config_path=args.config)
+        interactive = sys.stdin.isatty() and sys.stdout.isatty()
+        if not interactive and (not args.yes or not args.idempotency_key):
+            parser.error('Noninteractive send requires --yes and an explicit --idempotency-key')
+        return cmd_send(config_path=args.config, idempotency_key=args.idempotency_key,
+                        request_id=args.request_id, confirm_request=confirm_snapshot if interactive else None,
+                        **({"db_path": args.db} if args.db else {}))
     else:
         # Default behavior: offline dry-run
         return cmd_dry_run(config_path=args.config)
